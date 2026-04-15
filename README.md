@@ -44,11 +44,10 @@ exponents land in the lower half of each unit interval (vs. 50% random).
 The pipeline filters and scores new candidates by this resonance before
 committing GPU time to Lucas-Lehmer verification.
 
-**5. Analog 32-bit warp squaring path (k_sqr_warp32, `--analog`).**
+**5. Analog 32-bit warp squaring path (`k_sqr_warp32`, `--precision 32` / `--analog`).**
 An alternative squaring kernel that decomposes each 64-bit limb into 32-bit halves
-before warp-shuffle reduction, reducing the chance of 128-bit intermediate overflow
-at the cost of ~2× multiply operations per lane.  Selectable at runtime with
-`--analog`; produces identical results to the default path.
+before warp-shuffle reduction.  Selectable at runtime with `--precision 32` (or the
+legacy `--analog` alias); produces identical results to the default path.
 
 **6. Persistent on-device loop (`k_ll_persistent_block`, `--persistent`).**
 Runs all p−2 squaring iterations inside a single kernel launch: shared memory holds
@@ -129,7 +128,7 @@ CPU sub-2 mod M_p → h_x
 | `ll_small` | p ≤ 62 | — | `unsigned __int128`, direct fold |
 | `ll_cpu` | 62 < p ≤ 20 000 | — | Schoolbook MPI, `__int128` carry |
 | `ll_gpu` | p > 20 000 | (default) | `k_sqr_warp` 64-bit warp shuffle + CPU fold |
-| `ll_gpu_analog` | p > 20 000 | `--analog` | `k_sqr_warp32` 32-bit decomposition variant |
+| `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
 
 ### Benchmarks (RTX 2060, sm_75, April 2026)
@@ -169,18 +168,27 @@ build_ll.bat
 
 **Usage:**
 ```
-ll_mpi.exe <p>                       # test M_p, print PRIME / COMPOSITE
-ll_mpi.exe --selftest                # 25 known cases (CPU + GPU), ~0.1 s total
-ll_mpi.exe --selftest --analog       # selftest on analog (warp32) path
-ll_mpi.exe --selftest --persistent   # selftest on persistent single-launch path
-ll_mpi.exe <p> --verbose             # timing + resonance report
-ll_mpi.exe <p> --analog              # 32-bit decomposition squaring path
-ll_mpi.exe <p> --persistent          # single kernel, all iterations on-device
-ll_mpi.exe --gpu-info                # list CUDA devices
+ll_mpi.exe <p>                          # test M_p, print PRIME / COMPOSITE
+ll_mpi.exe --selftest                   # 25 known cases (CPU + GPU), ~0.1 s total
+ll_mpi.exe --selftest --precision 32    # selftest on 32-bit decomposition path
+ll_mpi.exe --selftest --persistent      # selftest on persistent single-launch path
+ll_mpi.exe <p> --verbose                # timing + resonance report
+ll_mpi.exe <p> --precision 64           # 64-bit warp squaring via __int128 (default)
+ll_mpi.exe <p> --precision 32           # 32-bit half-multiply decomposition
+ll_mpi.exe <p> --analog                 # legacy alias for --precision 32
+ll_mpi.exe <p> --persistent             # single kernel, all iterations on-device
+ll_mpi.exe --gpu-info                   # list CUDA devices
 ```
 
-Flags can be combined freely; all three option flags scan the full `argv` array,
-so order relative to `<p>` does not matter.
+**`--precision` values:**
+
+| Value | Kernel | Inner multiply | Notes |
+|-------|--------|---------------|-------|
+| `64` | `k_sqr_warp` | `__int128` (64×64→128) | Default — fastest |
+| `32` | `k_sqr_warp32` | 32-bit half-multiply (32×32→64 ×4) | Same result, ~15% slower; `--analog` is an alias |
+
+All flags scan the full `argv` array; order relative to `<p>` does not matter.
+Flags may be freely combined (`--precision 32 --verbose`, `--selftest --precision 32`, etc.).
 
 ---
 
