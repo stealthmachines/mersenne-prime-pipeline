@@ -160,6 +160,27 @@ bottleneck.
 All exponents above are verified Mersenne primes (PRIME result, 25/25 selftest pass
 on both default and persistent paths).
 
+**Benchmark methodology note — precision vs algorithm:**
+
+These numbers are not directly comparable to GpuOwl or Prime95 because the two
+engines sit at different points on two independent axes:
+
+| Axis | This engine | GpuOwl / Prime95 |
+|------|-------------|------------------|
+| Arithmetic | **Exact schoolbook integer** — every bit correct by construction | FP-NTT (FP64, ~20-bit limbs) — bounded rounding error, Gerbicz-checked |
+| Complexity | O(n²) per iteration | O(n log n) per iteration |
+
+A floating-point squaring kernel (`--precision fp`) would require changing the limb
+representation: our 64-bit limbs produce 128-bit products that overflow the FP64
+53-bit mantissa.  Correct FP multiplication requires limbs ≤ 26 bits — a full
+data-layout refactor.  Even after that change, the FP speedup would be ~2–3× on
+raw multiply throughput.  The remaining ~250–300× gap to GpuOwl at p = 1 M is
+purely algorithmic (O(n²) schoolbook vs O(n log n) NTT) and unaffected by
+precision tier.
+
+The engine is intentionally a **provably-exact reference verifier**, not a speed
+competitor.
+
 **Build:** `build_ll.bat`  (requires clang + CUDA 13.2)
 
 ```bat
