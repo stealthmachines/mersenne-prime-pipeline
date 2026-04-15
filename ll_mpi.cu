@@ -77,8 +77,9 @@ static const int PRIMES50[50] = {
     179, 181, 191, 193, 197, 199, 211, 223, 227, 229
 };
 
-static int g_use_analog_gpu   = 0;
+static int g_use_analog_gpu   = 0;   /* legacy alias for --precision 32 */
 static int g_use_persistent   = 0;
+static int g_precision        = 64;  /* squaring limb width: 32 or 64 */
 static void cpu_fold_sub2(uint64_t *h_flat, const uint8_t *h_ovf,
                           uint64_t *h_x, size_t n, size_t n2,
                           int pw, int pb);
@@ -1426,7 +1427,7 @@ static int ll_test(uint64_t p, int verbose) {
     int result;
     if      (p <= 62)      result = ll_small(p, verbose);
     else if (p <= CPU_TH)  result = ll_cpu(p, verbose);
-    else if (g_use_analog_gpu)  result = ll_gpu_analog(p, verbose);
+    else if (g_use_analog_gpu || g_precision == 32)  result = ll_gpu_analog(p, verbose);
     else if (g_use_persistent)   result = ll_gpu_persistent(p, verbose);
     else                         result = ll_gpu(p, verbose);
 
@@ -1484,9 +1485,12 @@ static void run_selftest(void) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage:\n");
-        printf("  ll_mpi.exe --selftest [--persistent]\n");
-        printf("  ll_mpi.exe <p> [--verbose] [--analog] [--persistent]\n");
+        printf("  ll_mpi.exe --selftest [--persistent] [--precision <32|64>]\n");
+        printf("  ll_mpi.exe <p> [--verbose] [--analog] [--persistent] [--precision <32|64>]\n");
         printf("  ll_mpi.exe --gpu-info\n");
+        printf("\n");
+        printf("  --precision 64   64-bit warp squaring via __int128 (default, fastest)\n");
+        printf("  --precision 32   32-bit half-multiply decomposition (same as --analog)\n");
         return 0;
     }
 
@@ -1496,17 +1500,26 @@ int main(int argc, char **argv) {
     int verbose     = 0;
     int analog      = 0;
     int persistent  = 0;
+    int precision   = 64;   /* default: 64-bit warp squaring */
     uint64_t p_arg  = 0;
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--selftest")   == 0) do_selftest = 1;
         else if (strcmp(argv[i], "--gpu-info")   == 0) do_gpuinfo  = 1;
         else if (strcmp(argv[i], "--verbose")    == 0) verbose     = 1;
-        else if (strcmp(argv[i], "--analog")     == 0) analog      = 1;
+        else if (strcmp(argv[i], "--analog")     == 0) { analog = 1; precision = 32; }
         else if (strcmp(argv[i], "--persistent") == 0) persistent  = 1;
+        else if (strcmp(argv[i], "--precision")  == 0) {
+            if (i + 1 < argc) {
+                int pv = atoi(argv[++i]);
+                if (pv == 32 || pv == 64) precision = pv;
+                else { fprintf(stderr, "--precision must be 32 or 64\n"); return 1; }
+            } else { fprintf(stderr, "--precision requires a value (32 or 64)\n"); return 1; }
+        }
         else p_arg = (uint64_t)strtoull(argv[i], NULL, 10);
     }
     g_use_analog_gpu = analog;
     g_use_persistent = persistent;
+    g_precision      = precision;
 
     if (do_selftest) {
         run_selftest();
