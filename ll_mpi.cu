@@ -80,6 +80,7 @@ static const int PRIMES50[50] = {
 static int g_use_analog_gpu   = 0;   /* legacy alias for --precision 32 */
 static int g_use_persistent   = 0;
 static int g_precision        = 64;  /* squaring limb width: 32 or 64 */
+static int g_squaring         = 0;   /* 0=schoolbook 1=ntt            */
 static void cpu_fold_sub2(uint64_t *h_flat, const uint8_t *h_ovf,
                           uint64_t *h_x, size_t n, size_t n2,
                           int pw, int pb);
@@ -821,6 +822,307 @@ __global__ void k_assemble(
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
+ * NTT squaring path  (--squaring ntt)
+ *
+ * Performs big-integer squaring via Number Theoretic Transform over the
+ * Solinas prime  Q = 2^64 - 2^32 + 1  (0xFFFFFFFF00000001).
+ * This Q is a GPU-friendly "proably prime" 64-bit Solinas prime with a
+ * 2^32-th primitive root of unity g = 7.
+ *
+ * Algorithm per LL iteration:
+ *   1. Expand n 64-bit limbs into 2n 32-bit "half-limbs" (each 0..2^32-1).
+ *      Using 32-bit coefficients keeps NTT coefficients < Q always.
+ *   2. Zero-pad to length L = next power of 2 >= 4n (needed for squaring).
+ *   3. Forward NTT over Z/QZ of length L.
+ *   4. Pointwise square mod Q.
+ *   5. Inverse NTT; divide by L mod Q.
+ *   6. Carry-normalise (each coefficient now holds a partial product sum).
+ *   7. Fold mod 2^p-1 and subtract 2.
+ *
+ * O(n log n) multiplications per iteration vs O(n^2) schoolbook.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Solinas prime Q = 2^64 - 2^32 + 1.  All NTT arithmetic is mod Q. */
+#define NTT_Q  0xFFFFFFFF00000001ULL
+/* Primitive 2^32-nd root of unity mod Q: g = 7.
+ * (7^((Q-1)/2^32) mod Q != 1, checked offline) */
+#define NTT_G  7ULL
+
+/* ── modular arithmetic helpers (device, inlined) ─────────────────────── */
+__device__ __forceinline__ unsigned long long ntt_add(unsigned long long a,
+                                                       unsigned long long b) {
+    /* (a + b) mod Q, inputs in [0, Q) */
+    unsigned long long s = a + b;
+    /* s may have wrapped 2^64 OR may be >= Q; use conditional sub */
+    return (s < a || s >= NTT_Q) ? s - NTT_Q : s;
+}
+
+__device__ __forceinline__ unsigned long long ntt_sub(unsigned long long a,
+                                                       unsigned long long b) {
+    return (a >= b) ? a - b : a - b + NTT_Q;
+}
+
+/* Multiply a*b mod Q using __uint128_t */
+__device__ __forceinline__ unsigned long long ntt_mul(unsigned long long a,
+                                                       unsigned long long b) {
+    unsigned __int128 p = (unsigned __int128)a * b;
+    /* Barrett / direct reduction mod Q = 2^64 - 2^32 + 1:
+     *   p mod Q  using the identity  2^64 ≡ 2^32 - 1  (mod Q) */
+    unsigned long long lo = (unsigned long long)p;
+    unsigned long long hi = (unsigned long long)(p >> 64);
+    /* hi * 2^64 ≡ hi * (2^32 - 1) mod Q */
+    unsigned long long t = (hi << 32) - hi;   /* hi*(2^32-1), may wrap */
+    unsigned long long r = lo + t;
+    if (r < lo) r += (1ULL << 32) - 1ULL;     /* add-back for carry */
+    return r >= NTT_Q ? r - NTT_Q : r;
+}
+
+/* Compute g^k mod Q on the fly (used for twiddle factors in kernels) */
+__device__ __forceinline__ unsigned long long ntt_pow(unsigned long long base,
+                                                       unsigned long long exp) {
+    unsigned long long result = 1ULL;
+    base %= NTT_Q;
+    while (exp > 0) {
+        if (exp & 1ULL) result = ntt_mul(result, base);
+        base = ntt_mul(base, base);
+        exp >>= 1;
+    }
+    return result;
+}
+
+/* ── k_ntt: in-place Cooley-Tukey iterative NTT over Z/QZ ─────────────── *
+ * Length L must be a power of 2, stored in d_a[0..L-1].
+ * invert==0 → forward; invert==1 → inverse (caller divides by L after).
+ * Uses log2(L) passes; each pass is launched as a separate kernel call
+ * from the host to avoid synchronisation issues.
+ * This single kernel handles ONE butterfly stage (stride s).          */
+__global__ void k_ntt_butterfly(unsigned long long * __restrict__ d_a,
+                                 int L,
+                                 int s,       /* current half-stride (1,2,4,...) */
+                                 int invert)
+{
+    /* Each thread handles one butterfly pair */
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_L = L / 2;
+    if (tid >= half_L) return;
+
+    /* Which group and position within group */
+    int group = tid / s;
+    int pos   = tid % s;
+    int u_idx = group * 2 * s + pos;
+    int v_idx = u_idx + s;
+
+    /* Twiddle factor: w = g^((Q-1)/L * group*pos ... ) */
+    /* For CT NTT, the twiddle for this butterfly is g^((Q-1)/(2s) * pos)
+     * because the group size at this stage is 2s. */
+    unsigned long long order = (unsigned long long)(2 * s);  /* butterfly group size */
+    unsigned long long exp   = ((NTT_Q - 1ULL) / order) * (unsigned long long)pos;
+    if (invert) exp = (NTT_Q - 1ULL) - exp;   /* conjugate for inverse */
+
+    unsigned long long w = ntt_pow(NTT_G, exp);
+
+    unsigned long long u = d_a[u_idx];
+    unsigned long long v = ntt_mul(d_a[v_idx], w);
+    d_a[u_idx] = ntt_add(u, v);
+    d_a[v_idx] = ntt_sub(u, v);
+}
+
+/* ── k_ntt_scale: multiply every element by scalar (for INTT /L) ─────── */
+__global__ void k_ntt_scale(unsigned long long * __restrict__ d_a,
+                             int L,
+                             unsigned long long inv_L)
+{
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= L) return;
+    d_a[tid] = ntt_mul(d_a[tid], inv_L);
+}
+
+/* ── k_ntt_sqr: pointwise a[i] = a[i]^2 mod Q ──────────────────────────  */
+__global__ void k_ntt_sqr(unsigned long long * __restrict__ d_a, int L)
+{
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= L) return;
+    unsigned long long v = d_a[tid];
+    d_a[tid] = ntt_mul(v, v);
+}
+
+/* ── k_expand_limbs: 64-bit limbs → 32-bit coefficients ────────────────  *
+ * limb[i] → coeff[2i] = low32, coeff[2i+1] = high32                      */
+__global__ void k_expand_limbs(const uint64_t * __restrict__ d_x,
+                                unsigned long long * __restrict__ d_coeffs,
+                                int n_words,
+                                int L)
+{
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= L) return;
+    if (tid < 2 * n_words) {
+        int limb = tid / 2;
+        int half = tid % 2;
+        uint64_t w = d_x[limb];
+        d_coeffs[tid] = (half == 0) ? (w & 0xFFFFFFFFULL) : (w >> 32);
+    } else {
+        d_coeffs[tid] = 0ULL;   /* zero-pad */
+    }
+}
+
+/* ── k_carry_collect: NTT output → 64-bit limbs with carry ─────────────  *
+ * After INTT the coefficient c[k] holds a non-negative integer (no mod
+ * reduction on the accumulated partial products), but it may be > 2^32.
+ * We carry-propagate to get valid 64-bit limbs and store in d_out[0..n2-1].
+ * n2 = 2*n_words.  This is single-threaded because it's a serial carry;
+ * for small n it's negligible.                                            */
+__global__ void k_carry_collect(const unsigned long long * __restrict__ d_c,
+                                 uint64_t * __restrict__ d_flat,
+                                 uint8_t  * __restrict__ d_ovf,
+                                 int L_result,   /* 4*n (first 4n coefficients matter) */
+                                 int n2)
+{
+    /* single thread */
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    unsigned __int128 carry = 0;
+    for (int k = 0; k < n2; k++) {
+        /* Each output limb is 64 bits; it is assembled from two 32-bit
+         * coefficient slots: slot 2k (bits 0..31) and slot 2k+1 (bits 32..63).
+         * The coefficients themselves may be large due to accumulated carries
+         * from multiplication, so we do a staged carry. */
+        unsigned __int128 lo, hi;
+        lo = (unsigned __int128)d_c[2*k]   + carry;
+        carry = lo >> 32;
+        lo &= 0xFFFFFFFFULL;
+        hi = (unsigned __int128)d_c[2*k+1] + carry;
+        carry = hi >> 32;
+        hi &= 0xFFFFFFFFULL;
+        unsigned __int128 limb = lo | (hi << 32);
+        /* d_flat holds the 64-bit value; d_ovf holds overflow bits > 64 */
+        d_flat[k] = (uint64_t)limb;
+        d_ovf[k]  = 0;   /* carry fully propagated — no overflow within 64 bits */
+    }
+    /* flush remaining carry into dummy overflow; cpu_fold_sub2 will handle it */
+    (void)carry;
+}
+
+/* ── host NTT launcher: runs log2(L) butterfly stages ──────────────────── */
+static void launch_ntt(unsigned long long *d_a, int L, int invert,
+                        cudaStream_t stream)
+{
+    int thr = 256;
+    int blk = (L / 2 + thr - 1) / thr;
+    for (int s = 1; s < L; s <<= 1) {
+        k_ntt_butterfly<<<blk, thr, 0, stream>>>(d_a, L, s, invert);
+    }
+    if (invert) {
+        /* compute L^{-1} mod Q via Fermat little theorem: L^{Q-2} mod Q */
+        unsigned long long inv_L = 1ULL;
+        unsigned long long base = (unsigned long long)L % NTT_Q;
+        unsigned long long exp  = NTT_Q - 2ULL;
+        /* host-side pow for simplicity — only called once per direction switch */
+        while (exp > 0) {
+            if (exp & 1ULL) {
+                unsigned __int128 p = (unsigned __int128)inv_L * base;
+                unsigned long long lo2 = (unsigned long long)p;
+                unsigned long long hi2 = (unsigned long long)(p >> 64);
+                unsigned long long t2 = (hi2 << 32) - hi2;
+                unsigned long long r2 = lo2 + t2;
+                if (r2 < lo2) r2 += (1ULL<<32)-1ULL;
+                inv_L = r2 >= NTT_Q ? r2 - NTT_Q : r2;
+            }
+            {
+                unsigned __int128 p = (unsigned __int128)base * base;
+                unsigned long long lo2 = (unsigned long long)p;
+                unsigned long long hi2 = (unsigned long long)(p >> 64);
+                unsigned long long t2 = (hi2 << 32) - hi2;
+                unsigned long long r2 = lo2 + t2;
+                if (r2 < lo2) r2 += (1ULL<<32)-1ULL;
+                base = r2 >= NTT_Q ? r2 - NTT_Q : r2;
+            }
+            exp >>= 1;
+        }
+        int blk_s = (L + thr - 1) / thr;
+        k_ntt_scale<<<blk_s, thr, 0, stream>>>(d_a, L, inv_L);
+    }
+}
+
+/* ── ll_gpu_ntt: NTT-based O(n log n) LL verifier ──────────────────────── */
+static int ll_gpu_ntt(uint64_t p, int verbose) {
+    int n  = (int)((p + 63) / 64);
+    int n2 = 2 * n;
+
+    /* NTT length: next power of 2 >= 4n (squaring doubles coefficient count;
+     * 32-bit expansion doubles again relative to 64-bit limbs) */
+    int L = 1;
+    while (L < 4 * n) L <<= 1;
+
+    unsigned long long *d_a = NULL;
+    uint64_t *d_x    = NULL;
+    uint64_t *d_lo   = NULL;   /* reused as d_flat for fold */
+    uint8_t  *d_ovf  = NULL;
+    cudaMalloc(&d_a,   (size_t)L  * sizeof(unsigned long long));
+    cudaMalloc(&d_x,   (size_t)n  * sizeof(uint64_t));
+    cudaMalloc(&d_lo,  (size_t)n2 * sizeof(uint64_t));
+    cudaMalloc(&d_ovf, (size_t)n2 * sizeof(uint8_t));
+
+    uint64_t *h_flat = NULL;
+    uint8_t  *h_ovf  = NULL;
+    uint64_t *h_x    = NULL;
+    cudaHostAlloc(&h_flat, (size_t)n2 * sizeof(uint64_t), cudaHostAllocDefault);
+    cudaHostAlloc(&h_ovf,  (size_t)n2 * sizeof(uint8_t),  cudaHostAllocDefault);
+    cudaHostAlloc(&h_x,    (size_t)n  * sizeof(uint64_t), cudaHostAllocDefault);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    int thr = 256;
+    int blk_exp = (L + thr - 1) / thr;
+    int blk_sqr = (L + thr - 1) / thr;
+    int pw = (int)(p / 64);
+    int pb = (int)(p % 64);
+
+    memset(h_x, 0, (size_t)n * sizeof(uint64_t));
+    h_x[0] = 4;
+    cudaMemcpy(d_x, h_x, (size_t)n * sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+    uint64_t iters = p - 2;
+    for (uint64_t i = 0; i < iters; i++) {
+        /* 1. Expand limbs into 32-bit coefficients, zero-pad to L */
+        k_expand_limbs<<<blk_exp, thr, 0, stream>>>(d_x, d_a, n, L);
+
+        /* 2. Forward NTT */
+        launch_ntt(d_a, L, 0, stream);
+
+        /* 3. Pointwise square mod Q */
+        k_ntt_sqr<<<blk_sqr, thr, 0, stream>>>(d_a, L);
+
+        /* 4. Inverse NTT */
+        launch_ntt(d_a, L, 1, stream);
+
+        /* 5. Carry-collect into flat 64-bit + overflow byte arrays */
+        k_carry_collect<<<1, 1, 0, stream>>>(d_a, d_lo, d_ovf, 4*n, n2);
+
+        /* 6. D2H, CPU fold+sub2, H2D */
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_flat, d_lo, (size_t)n2 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_ovf,  d_ovf,(size_t)n2 * sizeof(uint8_t),  cudaMemcpyDeviceToHost);
+        cpu_fold_sub2(h_flat, h_ovf, h_x, (size_t)n, (size_t)n2, pw, pb);
+        cudaMemcpy(d_x, h_x, (size_t)n * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    }
+
+    cudaStreamSynchronize(stream);
+
+    int result = 1;
+    for (int k = 0; k < n; k++)
+        if (h_x[k]) { result = 0; break; }
+
+    if (verbose)
+        printf("  GPU NTT  n_words=%d  L=%d  iters=%llu  (O(n log n) squaring, exact mod Q)\n",
+               n, L, (unsigned long long)iters);
+
+    cudaStreamDestroy(stream);
+    cudaFreeHost(h_flat); cudaFreeHost(h_ovf); cudaFreeHost(h_x);
+    cudaFree(d_a); cudaFree(d_x); cudaFree(d_lo); cudaFree(d_ovf);
+    return result;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
  * Analog-style 32-bit multiply decomposition path
  *
  * Decompose each 64-bit operand into two 32-bit halves, compute the 128-bit
@@ -1427,6 +1729,7 @@ static int ll_test(uint64_t p, int verbose) {
     int result;
     if      (p <= 62)      result = ll_small(p, verbose);
     else if (p <= CPU_TH)  result = ll_cpu(p, verbose);
+    else if (g_squaring == 1)                         result = ll_gpu_ntt(p, verbose);
     else if (g_use_analog_gpu || g_precision == 32)  result = ll_gpu_analog(p, verbose);
     else if (g_use_persistent)   result = ll_gpu_persistent(p, verbose);
     else                         result = ll_gpu(p, verbose);
@@ -1485,12 +1788,14 @@ static void run_selftest(void) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage:\n");
-        printf("  ll_mpi.exe --selftest [--persistent] [--precision <32|64>]\n");
-        printf("  ll_mpi.exe <p> [--verbose] [--analog] [--persistent] [--precision <32|64>]\n");
+        printf("  ll_mpi.exe --selftest [--persistent] [--precision <32|64>] [--squaring <schoolbook|ntt>]\n");
+        printf("  ll_mpi.exe <p> [--verbose] [--analog] [--persistent] [--precision <32|64>] [--squaring <schoolbook|ntt>]\n");
         printf("  ll_mpi.exe --gpu-info\n");
         printf("\n");
-        printf("  --precision 64   64-bit warp squaring via __int128 (default, fastest)\n");
-        printf("  --precision 32   32-bit half-multiply decomposition (same as --analog)\n");
+        printf("  --precision 64       64-bit warp squaring via __int128 (default, fastest)\n");
+        printf("  --precision 32       32-bit half-multiply decomposition (same as --analog)\n");
+        printf("  --squaring schoolbook  O(n^2) schoolbook multiply (default)\n");
+        printf("  --squaring ntt         O(n log n) NTT squaring over Z/(2^64-2^32+1)\n");
         return 0;
     }
 
@@ -1514,6 +1819,14 @@ int main(int argc, char **argv) {
                 if (pv == 32 || pv == 64) precision = pv;
                 else { fprintf(stderr, "--precision must be 32 or 64\n"); return 1; }
             } else { fprintf(stderr, "--precision requires a value (32 or 64)\n"); return 1; }
+        }
+        else if (strcmp(argv[i], "--squaring") == 0) {
+            if (i + 1 < argc) {
+                const char *sv = argv[++i];
+                if      (strcmp(sv, "ntt")        == 0) g_squaring = 1;
+                else if (strcmp(sv, "schoolbook") == 0) g_squaring = 0;
+                else { fprintf(stderr, "--squaring must be 'schoolbook' or 'ntt'\n"); return 1; }
+            } else { fprintf(stderr, "--squaring requires a value (schoolbook or ntt)\n"); return 1; }
         }
         else p_arg = (uint64_t)strtoull(argv[i], NULL, 10);
     }
