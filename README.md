@@ -128,6 +128,7 @@ CPU sub-2 mod M_p → h_x
 | `ll_small` | p ≤ 62 | — | `unsigned __int128`, direct fold |
 | `ll_cpu` | 62 < p ≤ 20 000 | — | Schoolbook MPI, `__int128` carry |
 | `ll_gpu` | p > 20 000 | (default) | `k_sqr_warp` 64-bit warp shuffle + CPU fold |
+| `ll_gpu_ntt` | p > 20 000 | `--squaring ntt` | `k_ntt_butterfly` + `k_ntt_sqr` — O(n log n) NTT over Z/(2⁶⁴−2³²+1), exact |
 | `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
 
@@ -137,13 +138,28 @@ CPU sub-2 mod M_p → h_x
 
 | Exponent p | Words n | Iterations | Time | vs limb baseline |
 |------------|---------|-----------|------|------------------|
-| 21 701 | 340 | 21 699 | **2.28 s** | 1.21× faster |
-| 44 497 | 696 | 44 495 | **4.25 s** | 1.63× faster |
-| 86 243 | 1 348 | 86 241 | **10.2 s** | 2.08× faster |
-| 110 503 | 1 727 | 110 501 | **21.3 s** | 2.54× faster |
+| 21 701 | 340 | 21 699 | **3.7 s** | — |
+| 44 497 | 696 | 44 495 | **7.0 s** | — |
+| 86 243 | 1 348 | 86 241 | **14.7 s** | — |
+| 110 503 | 1 727 | 110 501 | **22.4 s** | — |
 
 Speedup grows with p because larger n means longer warp inner loops — the 32-lane
 warp reduction provides a larger multiplier on the serial inner-product bottleneck.
+
+**NTT path (`--squaring ntt` — O(n log n) squaring over Z/QZ):**
+
+| Exponent p | Words n | NTT length L | Time | vs schoolbook |
+|------------|---------|-------------|------|---------------|
+| 21 701 | 340 | 2 048 | **15.5 s** | 4.2× slower |
+| 44 497 | 696 | 4 096 | **36.5 s** | 5.2× slower |
+| 86 243 | 1 348 | 8 192 | **79.0 s** | 5.4× slower |
+| 110 503 | 1 727 | 8 192 | **105.1 s** | 4.7× slower |
+
+NTT is slower at these sizes because the current implementation computes twiddle
+factors on-the-fly per butterfly thread via a full modular exponentiation (`ntt_pow`,
+O(log Q) ≈ 64 mults per thread), making the effective cost O(n log n × log Q) rather
+than pure O(n log n).  The schoolbook warp kernel wins up to at least p = 110 503.
+A production NTT would precompute twiddle tables, eliminating that constant.
 
 **Persistent path (`--persistent` — single kernel launch):**
 
@@ -158,7 +174,7 @@ worthwhile only at very small p where kernel-launch overhead would itself be the
 bottleneck.
 
 All exponents above are verified Mersenne primes (PRIME result, 25/25 selftest pass
-on both default and persistent paths).
+on all paths).
 
 **Benchmark methodology note — precision vs algorithm:**
 
@@ -168,15 +184,14 @@ engines sit at different points on two independent axes:
 | Axis | This engine | GpuOwl / Prime95 |
 |------|-------------|------------------|
 | Arithmetic | **Exact schoolbook integer** — every bit correct by construction | FP-NTT (FP64, ~20-bit limbs) — bounded rounding error, Gerbicz-checked |
-| Complexity | O(n²) per iteration | O(n log n) per iteration |
+| Complexity | O(n²) per iteration (default), O(n log n) with `--squaring ntt` | O(n log n) per iteration |
 
-A floating-point squaring kernel (`--precision fp`) would require changing the limb
-representation: our 64-bit limbs produce 128-bit products that overflow the FP64
-53-bit mantissa.  Correct FP multiplication requires limbs ≤ 26 bits — a full
-data-layout refactor.  Even after that change, the FP speedup would be ~2–3× on
-raw multiply throughput.  The remaining ~250–300× gap to GpuOwl at p = 1 M is
-purely algorithmic (O(n²) schoolbook vs O(n log n) NTT) and unaffected by
-precision tier.
+Using `--squaring ntt` isolates the algorithmic axis: it matches GpuOwl's complexity
+class while remaining **exact-integer arithmetic** (mod the Solinas prime Q = 2^64−2^32+1),
+not floating-point.  In this configuration the remaining gap is solely constant-factor
+(unoptimised twiddle computation + CPU fold round-trip latency), not a fundamental
+algorithmic deficit.  A twiddle-precomputed, fully on-device NTT would close that gap
+to within GPU utilisation and memory-bandwidth effects.
 
 The engine is intentionally a **provably-exact reference verifier**, not a speed
 competitor.
@@ -192,11 +207,14 @@ build_ll.bat
 ll_mpi.exe <p>                          # test M_p, print PRIME / COMPOSITE
 ll_mpi.exe --selftest                   # 25 known cases (CPU + GPU), ~0.1 s total
 ll_mpi.exe --selftest --precision 32    # selftest on 32-bit decomposition path
+ll_mpi.exe --selftest --squaring ntt    # selftest on NTT squaring path
 ll_mpi.exe --selftest --persistent      # selftest on persistent single-launch path
 ll_mpi.exe <p> --verbose                # timing + resonance report
 ll_mpi.exe <p> --precision 64           # 64-bit warp squaring via __int128 (default)
 ll_mpi.exe <p> --precision 32           # 32-bit half-multiply decomposition
 ll_mpi.exe <p> --analog                 # legacy alias for --precision 32
+ll_mpi.exe <p> --squaring schoolbook    # O(n²) schoolbook multiply (default)
+ll_mpi.exe <p> --squaring ntt           # O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
 ll_mpi.exe <p> --persistent             # single kernel, all iterations on-device
 ll_mpi.exe --gpu-info                   # list CUDA devices
 ```
