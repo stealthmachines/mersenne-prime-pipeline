@@ -5,7 +5,7 @@ verifying them with Lucas-Lehmer, running on an **RTX 2060 12 GB** (CUDA sm_75).
 
 ## What Is It?
 
-This is an end-to-end system for hunting the next world-record Mersenne prime.
+This is an end-to-end system in beta for eventually hunting the next world-record Mersenne prime.
 It combines two original mathematical ideas — a **phi-lattice resonance scoring
 function** and the **HDGL wu-wei data-flow model** — with a hand-optimised,
 exact-integer Lucas-Lehmer GPU verifier.
