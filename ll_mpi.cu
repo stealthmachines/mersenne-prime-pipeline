@@ -859,11 +859,14 @@ __global__ void k_sqr_warp32(const uint64_t * __restrict__ x,
         uint64_t p3 = a_hi * b_hi;
 
         uint64_t mid = p1 + p2;
-        uint64_t carry_mid = (mid < p1) ? 1ULL : 0ULL;
+        /* carry_mid: p1+p2 overflowed 2^64, contributing 2^64 extra to mid.
+         * That extra 2^64, after the <<32 shift, contributes 2^96 to the
+         * 128-bit product — i.e. 2^32 to the hi word, NOT 1. */
+        uint64_t p1p2_carry = (mid < p1) ? (1ULL << 32) : 0ULL;
 
         uint64_t lo = p0 + (mid << 32);
-        if (lo < p0) carry_mid++;
-        uint64_t hi = p3 + (mid >> 32) + carry_mid;
+        uint64_t lo_carry = (lo < p0) ? 1ULL : 0ULL;
+        uint64_t hi = p3 + (mid >> 32) + p1p2_carry + lo_carry;
 
         uint64_t old = acc_lo;
         acc_lo += lo;
