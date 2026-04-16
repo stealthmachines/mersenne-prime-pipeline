@@ -280,17 +280,18 @@ bottleneck.
 | 521 | 9 | 0.025 s | ~1.1× slower | ~1.0× (parity) |
 | 2 281 | 36 | 0.041 s | ~1.4× slower | ~1.4× slower |
 | 4 423 | 70 | 0.086 s | ~1.2× slower | ~1.2× slower |
-| 9 689 | 152 | 0.382 s | **1.3× faster** | **1.6× faster** |
-| 21 701 | 340 | 3.137 s | **1.2× faster** | ~2.2× slower |
+| 9 689 | 152 | 0.342 s | **1.5× faster** | **1.7× faster** |
+| 21 701 | 340 | 3.14 s | **1.2× faster** | ~2.2× slower |
 | 44 497 | 696 | 25.08 s | ~3.5× slower | ~5.9× slower |
 
-Timings with half-squaring + VCO + `-O3 -march=native` (see Planned optimisations — items 1, 2 done).
+Timings with half-squaring + VCO + mean-field Kuramoto + `-O3 -march=native` (see Planned optimisations — items 1, 2, 3 done).
 At p = 9 689 and p = 21 701 the analog path **beats schoolbook GPU** — both are O(n²) but
 `ap_sqr_mersenne` only computes the upper triangle (~n²/2 multiplies) plus the diagonal,
 and Intel scalar 64-bit with `-O3` micro-benchmarks faster than the GPU kernel at these
 sizes.  At p = 44 497 (n = 696) the GPU's parallelism asserts and gpucarry pulls away.
-The RK4 oscillator (~256 `sin()` calls per iteration) contributes negligibly (<0.4% of
-runtime at all measured exponents).  Further opportunities: see
+The RK4 oscillator uses ~32 trig calls per step (mean-field reduction: N² sin → N sincos;
+k1 reuses s->re/im; total 32 vs old 272); contributes <0.3% of runtime at large p,
+but ~10% at p ≤ 521 where mean-field gives measurable speedup.  Further opportunities: see
 [Planned optimisations for `ll_analog`](#planned-optimisations-for-ll_analog) below.
 
 Oscillator behaviour: on Mersenne primes the phase CV drops from ~1.6 (Pluck) to <0.002
@@ -326,27 +327,41 @@ competitor.
 ### Planned optimisations for `ll_analog`
 
 The analog path is correct and self-contained but uses a naive full-triangle schoolbook
-multiply.  The following are planned:
+multiply.  The following are planned (HDGL phi-language framing: arithmetic layer =
+Base4096 exact vector; oscillator layer = harmonic/recursive glyph):
 
-1. ✅ **Half-squaring** (done — `-O3 -march=native`, 3-phase upper-triangle + double +
-   diagonal; ~2× speedup confirmed: p=21701 6.27 s → 3.23 s, p=44497 52.0 s → 25.1 s;
-   at p=9689 now **beats** both schoolbook-GPU and gpucarry).
-2. ✅ **VCO — CV drives ω** (done — Kuramoto 1−R order parameter directly modulates
-   `ω_i = ω₀_i × (VCO_BASE + (1−VCO_BASE) × cv)`; floor=0.1 prevents oscillator freeze
-   at full lock; p=9689 0.400 s → 0.382 s, ~4.5% improvement; closes analog feedback loop).
-3. **`__int128` carry-chain merge**: fold the Mersenne reduction directly into the
-   schoolbook inner loop rather than building a separate 2n-word buffer.
-   Reduces peak memory traffic by ~50% for large n.
-4. **SIMD / auto-vectorisation**: expose the inner loop to `-O3 -march=native` loop
-   vectorisation by reformulating the carry-chain accumulator in scalar int64 + explicit
-   overflow flag (avoids the `__int128` barrier to auto-vec).
-5. **Schoolbook → Karatsuba cutover** at n ≥ 32 words for O(n^1.585) complexity.
-6. **Oscillator fast-path**: batch the 8D Kuramoto RK4 into SIMD doubles (AVX2:
-   256-bit lanes give 4 doubles/op; 8 oscillators = 2 AVX registers); the 256 `sin()`
-   calls per iteration then become the dominant cost and could be replaced with
-   minimax polynomial approximation (~4× faster than `libm sin`).
-7. **Hybrid mode**: use `ll_gpu_gpucarry` for squaring but drive KV4 oscillator on CPU
-   as a sidecar — getting the exact-GPU-speed answer plus the Kuramoto schedule readout.
+1. ✅ **Half-squaring — upper-triangle fold** (done — `-O3 -march=native`; ~2× speedup;
+   p=21701 6.27 s → 3.23 s; at p=9689 beats schoolbook-GPU and gpucarry).
+   *Phi-language*: distilled vector — only the upper-triangle of the n×n product is
+   computed; Mersenne fold = D_n_r reduction mod 2^p−1 applied inline.
+2. ✅ **VCO — CV drives ω** (done — Kuramoto 1−R order parameter modulates ω_i;
+   floor=0.1; p=9689 0.400 s → 0.382 s; closes analog feedback loop).
+   *Phi-language*: control voltage IS the order parameter — same scalar closes both
+   the harmonic layer (oscillator frequency) and the VCO feedback in one signal.
+3. ✅ **Mean-field Kuramoto coupling** (done — exact algebraic identity for all-to-all
+   coupling: Σ_j sin(θ_j−θ_i) = Im_Σ·cos θ_i − Re_Σ·sin θ_i; k1 reuses s->re/im;
+   trig calls per RK4 step: 272 → 32 (8.5× reduction); selftest 0.22s → 0.15s;
+   p=9689 0.382 s → 0.342 s, ~10.5% improvement).
+   *Phi-language*: the N×N coupling matrix compresses to the 2-component mean field
+   (Re_Σ, Im_Σ) — the same complex order-parameter already in the glyph. This IS
+   the HDGL "compressed atomic sequences" principle: maximal information, minimal form.
+4. **`__int128` carry-chain merge** (arithmetic layer — Base4096 exact vector):
+   fold the Mersenne reduction directly into the schoolbook inner loop; eliminate
+   the separate 2n-word scratch buffer. ~50% memory-traffic reduction for large n.
+   *Phi-language*: single distilled vector — no intermediate expanded form; the
+   Mersenne fold operator (D_n_r mod 2^p−1) collapses into the accumulation step.
+5. **SIMD / auto-vectorisation** (arithmetic layer): reformulate carry-chain in
+   scalar int64 + explicit overflow flag, removing the `__int128` barrier to
+   AVX2 auto-vectorisation. 8 mantissa words = natural AVX256-register width.
+   *Phi-language*: the n-word mantissa IS a flattened φ-lattice vector space;
+   AVX2 processes 4 limbs/cycle — native hardware parallelism of the Base4096 layer.
+6. **Schoolbook → Karatsuba cutover** at n ≥ 32 words for O(n^1.585) complexity.
+   *Phi-language*: D_n_r recursive splitting — `Glyph_next = D_n_r ⊗ Glyph_current`
+   at each recursion level; threshold n=32 is the glyph depth where recursive
+   scaling overtakes linear scan.
+7. **Hybrid mode**: `ll_gpu_gpucarry` squaring + CPU Kuramoto sidecar.
+   *Phi-language*: multi-modal glyph — Base4096 exact layer on GPU (arithmetic),
+   harmonic/recursive layer on CPU (oscillator); same Mersenne residue feeds both.
 
 **Build:** `build_ll.bat`  (requires clang + CUDA 13.2)
 

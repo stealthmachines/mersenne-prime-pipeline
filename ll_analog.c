@@ -185,19 +185,33 @@ typedef struct {
     double dtheta[ANA_DIMS];
 } AnaD;
 
-/* Evaluate Kuramoto phase derivatives.
- * dθ_i/dt = ω_i + K Σ_j sin(θ_j - θ_i)
- * re[i] / im[i] are NOT independently evolved — they are projections of theta:
- *   re[i] = cos(θ_i),  im[i] = sin(θ_i)
- * (set by ana_phase_double after each squaring step). */
+/* Evaluate Kuramoto phase derivatives — mean-field (compressed) form.
+ *
+ * Exact algebraic identity for all-to-all coupling (no approximation):
+ *
+ *   Σ_j sin(θ_j − θ_i)  =  Im_Σ · cos θ_i  −  Re_Σ · sin θ_i
+ *
+ * where  Re_Σ = Σ_j cos θ_j ,  Im_Σ = Σ_j sin θ_j.
+ *
+ * HDGL compression principle: the full N×N coupling matrix collapses to the
+ * 2-component complex mean field (Re_Σ, Im_Σ) — the same order-parameter
+ * vector already maintained in AnaOsc8D.re/im.  Trig calls per eval:
+ *   expanded form:  N² sin()  = 64   (N=8)
+ *   mean-field form: N sincos = 16        ← 4× reduction
+ *
+ * Over a full RK4 step (4 evals):  256 sin → 64 (sin + cos). */
 static AnaD ana_deriv(const AnaOsc8D *s, const double theta[ANA_DIMS]) {
-    AnaD d;
-    for (int i = 0; i < ANA_DIMS; i++) {
-        double sum_sin = 0.0;
-        for (int j = 0; j < ANA_DIMS; j++)
-            sum_sin += sin(theta[j] - theta[i]);
-        d.dtheta[i] = s->omega[i] + s->k_coupling * sum_sin;
+    double cs[ANA_DIMS], sn[ANA_DIMS];
+    double Re_S = 0.0, Im_S = 0.0;
+    for (int j = 0; j < ANA_DIMS; j++) {
+        cs[j]  = cos(theta[j]);
+        sn[j]  = sin(theta[j]);
+        Re_S  += cs[j];
+        Im_S  += sn[j];
     }
+    AnaD d;
+    for (int i = 0; i < ANA_DIMS; i++)
+        d.dtheta[i] = s->omega[i] + s->k_coupling * (Im_S * cs[i] - Re_S * sn[i]);
     return d;
 }
 
@@ -220,14 +234,26 @@ static void ana_phase_double(AnaOsc8D *s) {
 /* ── One Kuramoto RK4 step (phase synchronisation correction) ───────────────
  * Called AFTER ana_phase_double.  Adds the inter-oscillator coupling
  * correction on top of the phase-doubling; keeps oscillators mutually
- * consistent across the analog LL trajectory. */
+ * consistent across the analog LL trajectory.
+ *
+ * Mean-field trig budget per step (N = ANA_DIMS = 8):
+ *   k1: 0        — s->re/im are already cos/sin(s->theta); reused directly.
+ *   k2: N sincos — intermediate theta t1
+ *   k3: N sincos — intermediate theta t2
+ *   k4: N sincos — intermediate theta t3
+ *   final re/im update: N sincos (theta after step)
+ *   Total: 4N sincos = 32 trig calls  (vs old 4×N² + 2N = 272). */
 static void ana_rk4_step(AnaOsc8D *s) {
     double t1[ANA_DIMS], t2[ANA_DIMS], t3[ANA_DIMS];
 
-    /* k1 */
-    AnaD k1 = ana_deriv(s, s->theta);
-    for (int i = 0; i < ANA_DIMS; i++)
+    /* k1 — reuse s->re (= cos θ) and s->im (= sin θ); zero extra trig calls. */
+    double Re_S1 = 0.0, Im_S1 = 0.0;
+    for (int j = 0; j < ANA_DIMS; j++) { Re_S1 += s->re[j]; Im_S1 += s->im[j]; }
+    AnaD k1;
+    for (int i = 0; i < ANA_DIMS; i++) {
+        k1.dtheta[i] = s->omega[i] + s->k_coupling * (Im_S1 * s->re[i] - Re_S1 * s->im[i]);
         t1[i] = s->theta[i] + 0.5 * ANA_DT * k1.dtheta[i];
+    }
     /* k2 */
     AnaD k2 = ana_deriv(s, t1);
     for (int i = 0; i < ANA_DIMS; i++)
