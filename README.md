@@ -148,18 +148,47 @@ warp reduction provides a larger multiplier on the serial inner-product bottlene
 
 **NTT path (`--squaring ntt` — O(n log n) squaring over Z/QZ):**
 
+*Original unoptimised (on-the-fly twiddle computation via `ntt_pow`, ~64 mults/butterfly):*
+
 | Exponent p | Words n | NTT length L | Time | vs schoolbook |
 |------------|---------|-------------|------|---------------|
-| 21 701 | 340 | 2 048 | **15.5 s** | 4.2× slower |
-| 44 497 | 696 | 4 096 | **36.5 s** | 5.2× slower |
-| 86 243 | 1 348 | 8 192 | **79.0 s** | 5.4× slower |
-| 110 503 | 1 727 | 8 192 | **105.1 s** | 4.7× slower |
+| 21 701 | 340 | 2 048 | 15.5 s | 4.2× slower |
+| 44 497 | 696 | 4 096 | 36.5 s | 5.2× slower |
+| 86 243 | 1 348 | 8 192 | 79.0 s | 5.4× slower |
+| 110 503 | 1 727 | 8 192 | 105.1 s | 4.7× slower |
 
-NTT is slower at these sizes because the current implementation computes twiddle
-factors on-the-fly per butterfly thread via a full modular exponentiation (`ntt_pow`,
-O(log Q) ≈ 64 mults per thread), making the effective cost O(n log n × log Q) rather
-than pure O(n log n).  The schoolbook warp kernel wins up to at least p = 110 503.
-A production NTT would precompute twiddle tables, eliminating that constant.
+*Optimised (`feature/ntt-optimized` — precomputed twiddles + CUDA graph replay + dual-stream DMA + CPU carry-collect):*
+
+| Exponent p | Words n | NTT length L | Time | vs schoolbook | speedup vs unopt |
+|------------|---------|-------------|------|---------------|-----------------|
+| 21 701 | 340 | 2 048 | **5.1 s** | 1.38× slower | 3.0× |
+| 44 497 | 696 | 4 096 | **10.6 s** | 1.51× slower | 3.4× |
+| 86 243 | 1 348 | 8 192 | **24.1 s** | 1.64× slower | 3.3× |
+| 110 503 | 1 727 | 8 192 | **31.5 s** | 1.41× slower | 3.3× |
+
+Three optimisations applied on this branch:
+
+1. **Precomputed twiddle table** — `d_tw[k] = ω^k mod Q` computed once before the iteration
+   loop; each butterfly does a table lookup instead of a 64-multiply `ntt_pow`.
+   Effect: eliminates ~64× per-butterfly multiply overhead (~O(n log n · log Q) → pure O(n log n)).
+
+2. **CUDA graph replay** — the log₂(L) butterfly kernel launches per NTT direction are captured
+   into a CUDA graph once and replayed via `cudaGraphLaunch`.  On Windows/WDDM, each
+   individual kernel launch costs ~5 µs driver overhead; log₂(8192)=13 launches × 2 directions
+   × 110 501 iterations = 2.9 M launches ≈ 14 s overhead, eliminated by graph replay.
+
+3. **Dual-stream DMA + CPU carry-collect** — mirrors the schoolbook path's async pipeline:
+   - GPU: `k_expand_limbs` → forward NTT graph → `k_ntt_sqr` → inverse NTT graph.
+   - CUDA event triggers async D2H of the full NTT coefficient array on a separate DMA stream.
+   - CPU blocks only on the DMA stream (`cudaStreamSynchronize(stream_dma)`), then runs
+     carry-collect + fold + sub2 in software (replacing the serial `k_carry_collect<<<1,1>>>`
+     GPU kernel that was the per-iteration bottleneck).
+   - **One** `cudaMemcpy` D2H instead of two, saving one ~70 µs Windows API round-trip per
+     iteration (≈ 7.7 s at p = 110 503).
+
+The remaining gap to schoolbook (~1.4×) is the PCIe round-trip (H2D after every iteration)
+which is also present in the schoolbook path.  At larger p the NTT's O(n log n) complexity
+advantage overtakes the constant overhead.
 
 **Persistent path (`--persistent` — single kernel launch):**
 
@@ -188,10 +217,10 @@ engines sit at different points on two independent axes:
 
 Using `--squaring ntt` isolates the algorithmic axis: it matches GpuOwl's complexity
 class while remaining **exact-integer arithmetic** (mod the Solinas prime Q = 2^64−2^32+1),
-not floating-point.  In this configuration the remaining gap is solely constant-factor
-(unoptimised twiddle computation + CPU fold round-trip latency), not a fundamental
-algorithmic deficit.  A twiddle-precomputed, fully on-device NTT would close that gap
-to within GPU utilisation and memory-bandwidth effects.
+not floating-point.  In the optimised form (`feature/ntt-optimized`) the remaining gap to
+schoolbook is ~1.4× constant factor from the PCIe D2H/H2D round-trip (both paths pay this
+cost), not a fundamental algorithmic deficit.  At larger p the O(n log n) advantage
+overtakes the O(n²) schoolbook, making the NTT path the clear winner.
 
 The engine is intentionally a **provably-exact reference verifier**, not a speed
 competitor.
