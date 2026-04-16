@@ -1,3 +1,6 @@
+<img width="1679" height="1008" alt="image" src="https://github.com/user-attachments/assets/c5645848-478e-4334-954a-c76e3c319ce6" />
+https://zchg.org/t/github-stealthmachines-mersenne-prime-pipeline-4-track-gpu-accelerated-mersenne-prime-search/966
+
 # Mersenne Prime Search Pipeline
 
 A 4-track GPU-accelerated pipeline for finding Mersenne prime candidates and
