@@ -1,0 +1,59 @@
+# ── Compiled Windows binaries ─────────────────────────────────────────────
+*.exe
+*.obj
+*.lib
+*.pdb
+*.dll
+*.exp
+
+# ── Linux/macOS shared objects ─────────────────────────────────────────────
+*.so
+*.dylib
+*.o
+*.a
+
+# ── Build / run logs and output files ──────────────────────────────────────
+*.log
+build_out.txt
+op2_out.txt
+selftest.log
+eval_out.txt
+eval_out2.txt
+eval_result.txt
+results.tsv
+
+# ── Generated zip archives (keep base4096 distribution zips) ───────────────
+mersenne_prime_pipeline.zip
+mersenne_prime_pipeline_20260410.zip
+primes-backup.zip
+base4096-2.0.1/zip/
+base4096-2.0.1/*.zip
+!base4096-2.0.1/base4096_hkdf_seal.py
+
+# ── Large binary data generated at runtime ─────────────────────────────────
+zeros1.gz
+metal_infer_for_primes/hdgl_lattice.bin
+metal_infer_for_primes/hdgl_lattice_corpus.bin
+metal_infer_for_primes/hdgl_lattice_corpus_ngrams.bin
+metal_infer_for_primes/2.0
+
+# ── Binary placeholder files ───────────────────────────────────────────────
+base4096-2.0.1/spare parts/placeholder
+base4096-2.0.1/zip/placeholder
+
+# ── Office documents ───────────────────────────────────────────────────────
+*.docx
+*.xlsx
+*.pptx
+
+# ── IDE / editor workspace files ───────────────────────────────────────────
+*.code-workspace
+.vscode/
+
+# ── Generated images / visualisations ─────────────────────────────────────
+hdgl_harmonics_spiral10000_analog_v30/hdgl_spiral_visualization_v30.png
+
+# ── Python cache ───────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
