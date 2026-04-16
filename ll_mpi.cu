@@ -90,8 +90,11 @@ static const int PRIMES50[50] = {
 static int g_use_analog_gpu   = 0;   /* legacy alias for --precision 32 */
 static int g_use_persistent   = 0;
 static int g_precision        = 64;  /* squaring limb width: 32 or 64 */
-/* g_squaring: -1=auto (pick fastest based on p), 0=force schoolbook, 1=force ntt */
+/* g_squaring: -1=auto, 0=schoolbook, 1=ntt, 2=gpucarry, 3=analog (v30b+Kuramoto) */
 static int g_squaring         = -1;
+
+/* v30b + 8D Kuramoto analog LL path (ll_analog.c) */
+#include "ll_analog.h"
 static void cpu_fold_sub2(uint64_t *h_flat, const uint8_t *h_ovf,
                           uint64_t *h_x, size_t n, size_t n2,
                           int pw, int pb);
@@ -2302,8 +2305,9 @@ static int ll_test(uint64_t p, int verbose) {
                NTT_AUTO_THRESHOLD, use_ntt ? "NTT" : "schoolbook");
 
     int result;
-    if      (p <= 62)      result = ll_small(p, verbose);
-    else if (p <= CPU_TH)  result = ll_cpu(p, verbose);
+    if      (p <= 62 && g_squaring != 3)     result = ll_small(p, verbose);
+    else if (p <= CPU_TH && g_squaring != 3) result = ll_cpu(p, verbose);
+    else if (g_squaring == 3)                result = ll_analog(p, verbose);  /* v30b+Kuramoto */
     else if (use_ntt)                                 result = ll_gpu_ntt(p, verbose);
     else if (g_squaring == 2)                         result = ll_gpu_gpucarry(p, verbose);
     else if (g_squaring == 0)                         result = ll_gpu(p, verbose);
@@ -2370,9 +2374,11 @@ int main(int argc, char **argv) {
         printf("  ll_mpi.exe --gpu-info\n");
         printf("\n");
         printf("  --precision 64       64-bit warp squaring via __int128 (default, fastest)\n");
-        printf("  --precision 32       32-bit half-multiply decomposition (same as --analog)\n");
-        printf("  --squaring schoolbook  O(n^2) schoolbook multiply (default)\n");
+        printf("  --precision 32       32-bit half-multiply decomposition (same as --analog flag)\n");
+        printf("  --squaring schoolbook  O(n^2) schoolbook multiply (GPU, default)\n");
         printf("  --squaring ntt         O(n log n) NTT squaring over Z/(2^64-2^32+1)\n");
+        printf("  --squaring gpucarry    on-device parallel carry scan (auto default)\n");
+        printf("  --squaring analog      v30b Slot4096 APA + 8D Kuramoto oscillator (CPU, CUDA-free)\n");
         return 0;
     }
 
@@ -2404,8 +2410,9 @@ int main(int argc, char **argv) {
                 else if (strcmp(sv, "schoolbook") == 0) g_squaring = 0;
                 else if (strcmp(sv, "auto")       == 0) g_squaring = -1;
                 else if (strcmp(sv, "gpucarry")   == 0) g_squaring = 2;
-                else { fprintf(stderr, "--squaring must be 'auto', 'schoolbook', 'ntt', or 'gpucarry'\n"); return 1; }
-            } else { fprintf(stderr, "--squaring requires a value (auto|schoolbook|ntt|gpucarry)\n"); return 1; }
+                else if (strcmp(sv, "analog")      == 0) g_squaring = 3;
+                else { fprintf(stderr, "--squaring must be 'auto', 'schoolbook', 'ntt', 'gpucarry', or 'analog'\n"); return 1; }
+            } else { fprintf(stderr, "--squaring requires a value (auto|schoolbook|ntt|gpucarry|analog)\n"); return 1; }
         }
         else p_arg = (uint64_t)strtoull(argv[i], NULL, 10);
     }

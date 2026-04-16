@@ -12,10 +12,27 @@ set CUDA_LIB=%CUDA_PATH%\lib\x64
 set SRC=%~dp0ll_mpi.cu
 set OUT=%~dp0ll_mpi.exe
 
+set ANALOG_C=%~dp0ll_analog.c
+set ANALOG_OBJ=%~dp0ll_analog.obj
+
 echo [ll_mpi] Building Lucas-Lehmer MPI (schoolbook, sm_75)...
 echo   Source : %SRC%
 echo   Output : %OUT%
 
+echo [ll_mpi] Compiling ll_analog.c (pure C, no CUDA)...
+clang ^
+  -O2 ^
+  -D_CRT_SECURE_NO_WARNINGS ^
+  -Wall ^
+  -c "%ANALOG_C%" ^
+  -o "%ANALOG_OBJ%"
+
+if %ERRORLEVEL% neq 0 (
+    echo [ll_mpi] ll_analog.c compile FAILED.
+    exit /b 1
+)
+
+echo [ll_mpi] Linking CUDA main + analog object...
 clang ^
   --cuda-gpu-arch=sm_75 ^
   --cuda-path="%CUDA_PATH%" ^
@@ -23,6 +40,7 @@ clang ^
   -Wno-deprecated-declarations ^
   -D_CRT_SECURE_NO_WARNINGS ^
   -x cuda "%SRC%" ^
+  -x none "%ANALOG_OBJ%" ^
   -L"%CUDA_LIB%" -lcudart ^
   -O2 ^
   -o "%OUT%"
