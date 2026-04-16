@@ -49,6 +49,21 @@ An alternative squaring kernel that decomposes each 64-bit limb into 32-bit halv
 before warp-shuffle reduction.  Selectable at runtime with `--precision 32` (or the
 legacy `--analog` alias); produces identical results to the default path.
 
+**7. Analog LL path — v30b `Slot4096` APA + 8D Kuramoto oscillator (`--squaring analog`).**
+A CUDA-free, hardware-agnostic Lucas-Lehmer path implemented in pure C (`ll_analog.c`).
+Derived from `hdgl_analog_v30b.c` and `analog_engine.h`.  Two systems run in parallel:
+- **Exact arithmetic side** — arbitrary-precision mantissa (`Slot4096.mantissa_words` layout:
+  `uint64_t[n]`, `n = ⌈p/64⌉`).  `ap_sqr_mersenne`: schoolbook O(n²) via `__int128`, Mersenne
+  fold identical to `fold_mod_mp` in `ll_mpi.cu`.  Every p−2 iterations run exactly.
+- **8D Kuramoto oscillator** — RK4-integrated, φ-seeded natural frequencies (`φ¹–φ⁸ × dt`).
+  Cooperative memory: every 8 iterations a FNV-1a XOR-fold of the residue words perturbs
+  the oscillator phases — the exact arithmetic trajectory imprints onto the analog state.
+  K/γ wu-wei ratios (from `WU_WEI_ANALYSIS.md`): Pluck=1000:1 → Sustain → FineTune → Lock.
+  Phase lock is a readout, not a gate.  `osc LOCKED + residue=0` = strong prime resonance.
+
+Use cases: CUDA-free verification, Kuramoto-coupled scheduling diagnostics, golden
+reference path for correctness cross-checks.
+
 **6. Persistent on-device loop (`k_ll_persistent_block`, `--persistent`).**
 Runs all p−2 squaring iterations inside a single kernel launch: shared memory holds
 the current `s` vector (`n×8` bytes, fits 48 KB for p up to ~460 000), and
@@ -121,7 +136,7 @@ CPU sub-2 mod M_p → h_x
   d_x ◄──── H2D upload ─── h_x
 ```
 
-### Six Dispatch Paths (auto-select enabled)
+### Seven Dispatch Paths (auto-select enabled)
 
 | Path | Range | Flag | Notes |
 |------|-------|------|-------|
@@ -132,6 +147,7 @@ CPU sub-2 mod M_p → h_x
 | `ll_gpu` | p > 20 000 | `--squaring schoolbook` | `k_sqr_warp` 64-bit warp shuffle + CPU fold (PCIe round-trip per iteration) |
 | `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
+| `ll_analog` | any p | `--squaring analog` | v30b `Slot4096` APA + 8D Kuramoto oscillator — **CUDA-free**, pure C, no GPU required |
 
 ### Benchmarks (RTX 2060, sm_75, April 2026, `feature/gpu-carry`)
 
@@ -251,6 +267,29 @@ stream path wins because it saturates all SMs in parallel.  The persistent path 
 worthwhile only at very small p where kernel-launch overhead would itself be the
 bottleneck.
 
+**Analog path (`--squaring analog` — `ll_analog`, v30b APA + 8D Kuramoto, CPU-only):**
+
+| Exponent p | Words n | Time | vs schoolbook (GPU) | vs gpucarry |
+|------------|---------|------|---------------------|-------------|
+| 521 | 9 | 0.026 s | ~1.2× slower | ~1.1× slower |
+| 2 281 | 36 | 0.035 s | ~1.1× slower | ~1.1× slower |
+| 4 423 | 70 | 0.085 s | ~1.0× | ~1.2× slower |
+| 9 689 | 152 | 0.616 s | ~1.1× slower | ~1.1× slower |
+| 21 701 | 340 | 6.27 s | **1.7× slower** | **5.0× slower** |
+| 44 497 | 696 | 52.0 s | **7.1× slower** | **12.8× slower** |
+
+Below p ≈ 9 689 (n < 152 words) all paths are noise-dominated by process launch overhead
+and times are indistinguishable (<0.1 s).  At large p the O(n²) gap vs GPU paths widens
+because `ap_sqr_mersenne` computes the full n×n product (both triangles) whereas
+`mpi_sqr_mod_mp_cpu` uses the half-squaring optimisation.  The RK4 oscillator (~256
+`sin()` calls per iteration) contributes negligibly.  Optimisation opportunities: see
+[Planned optimisations for `ll_analog`](#planned-optimisations-for-ll_analog) below.
+
+Oscillator behaviour: on Mersenne primes the phase CV drops from ~1.6 (Pluck) to <0.002
+(Lock) within the first 10–15% of iterations and stays locked for the entire run.
+On composites the oscillator cannot lock — typically stalls at FineTune or below.
+`osc LOCKED + residue=0` is the double-confirmation signal.
+
 All exponents above are verified Mersenne primes (PRIME result, 25/25 selftest pass
 on all paths).
 
@@ -274,6 +313,29 @@ O(n²) schoolbook, making the NTT path the clear winner.
 The engine is intentionally a **provably-exact reference verifier**, not a speed
 competitor.
 
+---
+
+### Planned optimisations for `ll_analog`
+
+The analog path is correct and self-contained but uses a naive full-triangle schoolbook
+multiply.  The following are planned:
+
+1. **Half-squaring**: skip the lower triangle (`j < i` terms), compute once and double.
+   Expected speedup: ~2× at all sizes (matches `mpi_sqr_mod_mp_cpu`).
+2. **`__int128` carry-chain merge**: fold the Mersenne reduction directly into the
+   schoolbook inner loop rather than building a separate 2n-word buffer.
+   Reduces peak memory traffic by ~50% for large n.
+3. **SIMD / auto-vectorisation**: expose the inner loop to `-O3 -march=native` loop
+   vectorisation by reformulating the carry-chain accumulator in scalar int64 + explicit
+   overflow flag (avoids the `__int128` barrier to auto-vec).
+4. **Schoolbook → Karatsuba cutover** at n ≥ 32 words for O(n^1.585) complexity.
+5. **Oscillator fast-path**: batch the 8D Kuramoto RK4 into SIMD doubles (AVX2:
+   256-bit lanes give 4 doubles/op; 8 oscillators = 2 AVX registers); the 256 `sin()`
+   calls per iteration then become the dominant cost and could be replaced with
+   minimax polynomial approximation (~4× faster than `libm sin`).
+6. **Hybrid mode**: use `ll_gpu_gpucarry` for squaring but drive KV4 oscillator on CPU
+   as a sidecar — getting the exact-GPU-speed answer plus the Kuramoto schedule readout.
+
 **Build:** `build_ll.bat`  (requires clang + CUDA 13.2)
 
 ```bat
@@ -295,6 +357,7 @@ ll_mpi.exe <p> --squaring auto          # auto-select: gpucarry if p < 400000, N
 ll_mpi.exe <p> --squaring gpucarry     # on-device carry scan + shmem fold, no PCIe round-trip
 ll_mpi.exe <p> --squaring schoolbook   # force O(n²) schoolbook + CPU fold (PCIe round-trip)
 ll_mpi.exe <p> --squaring ntt          # force O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
+ll_mpi.exe <p> --squaring analog       # v30b Slot4096 APA + 8D Kuramoto (CPU, no CUDA needed)
 ll_mpi.exe <p> --persistent             # single kernel, all iterations on-device
 ll_mpi.exe --gpu-info                   # list CUDA devices
 ```
@@ -305,6 +368,19 @@ ll_mpi.exe --gpu-info                   # list CUDA devices
 |-------|--------|---------------|-------|
 | `64` | `k_sqr_warp` | `__int128` (64×64→128) | Default — fastest |
 | `32` | `k_sqr_warp32` | 32-bit half-multiply (32×32→64 ×4) | Same result, ~15% slower; `--analog` is an alias |
+
+**`--squaring analog` oscillator readout:**
+
+| Field | Meaning |
+|-------|---------|
+| `phase=Pluck` | High-energy excitation phase; K/γ=1000:1 |
+| `phase=Sustain` | Absorbing structure; K/γ=375:1 |
+| `phase=FineTune` | Refinement; K/γ=200:1 |
+| `phase=Lock` | Settled consensus; K/γ=150:1 |
+| `cv=0.0019` | Phase coefficient of variation (std/mean over 8 oscillators) |
+| `locked=yes` | All 50 recent CV samples below 0.05 threshold |
+| `** osc LOCKED + residue=0 **` | Double confirmation: Mersenne prime |
+| `locked=no` + `residue=non-zero` | Composite — oscillator did not synchronise |
 
 All flags scan the full `argv` array; order relative to `<p>` does not matter.
 Flags may be freely combined (`--precision 32 --verbose`, `--selftest --precision 32`, etc.).

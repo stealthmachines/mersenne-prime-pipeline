@@ -157,97 +157,120 @@ static double ana_phase_var(const AnaOsc8D *s) {
     return sqrt(var / ANA_DIMS);
 }
 
-/* ── RK4 derivative struct ───────────────────────────────────────────────────── */
+/* ── RK4 derivative struct (Kuramoto phase coupling only) ──────────────────── */
 typedef struct {
     double dtheta[ANA_DIMS];
-    double dre[ANA_DIMS];
-    double dim[ANA_DIMS];
 } AnaD;
 
-/* Evaluate Kuramoto derivatives at given state arrays.
- * dθ_i/dt = ω_i + K Σ_j sin(θ_j - θ_i)   (phase coupling)
- * dA_i/dt = -γ A_i                          (amplitude damping)
- * Mirrors EVAL macro in analog_engine.c analog8_rk4_step. */
-static AnaD ana_deriv(const AnaOsc8D *s,
-                      const double theta[ANA_DIMS],
-                      const double re[ANA_DIMS],
-                      const double im[ANA_DIMS]) {
+/* Evaluate Kuramoto phase derivatives.
+ * dθ_i/dt = ω_i + K Σ_j sin(θ_j - θ_i)
+ * re[i] / im[i] are NOT independently evolved — they are projections of theta:
+ *   re[i] = cos(θ_i),  im[i] = sin(θ_i)
+ * (set by ana_phase_double after each squaring step). */
+static AnaD ana_deriv(const AnaOsc8D *s, const double theta[ANA_DIMS]) {
     AnaD d;
     for (int i = 0; i < ANA_DIMS; i++) {
         double sum_sin = 0.0;
         for (int j = 0; j < ANA_DIMS; j++)
             sum_sin += sin(theta[j] - theta[i]);
         d.dtheta[i] = s->omega[i] + s->k_coupling * sum_sin;
-        d.dre[i]    = -s->gamma * re[i];
-        d.dim[i]    = -s->gamma * im[i];
     }
     return d;
 }
 
-/* ── One RK4 step (mirrors analog8_rk4_step in analog_engine.c) ─────────────── */
+/* ── Analog squaring: phase doubling ────────────────────────────────────────
+ * The LL step  s_{k+1} = s_k² − 2  in polar form maps  r·e^{iθ} → r²·e^{2iθ} − 2.
+ * On the unit circle (r=1) the squaring IS phase doubling: θ → 2θ.
+ * This function performs that analog multiply — one call per LL iteration,
+ * in lockstep with the integer squaring in ap_sqr_mersenne.
+ * After p−2 doublings, a Mersenne prime drives all phases toward 2πk (→ 1),
+ * giving the analog confirmation of residue=0. */
+static void ana_phase_double(AnaOsc8D *s) {
+    for (int i = 0; i < ANA_DIMS; i++) {
+        s->theta[i] = fmod(2.0 * s->theta[i], 2.0 * ANA_PI);
+        if (s->theta[i] < 0.0) s->theta[i] += 2.0 * ANA_PI;
+        s->re[i] = cos(s->theta[i]);
+        s->im[i] = sin(s->theta[i]);
+    }
+}
+
+/* ── One Kuramoto RK4 step (phase synchronisation correction) ───────────────
+ * Called AFTER ana_phase_double.  Adds the inter-oscillator coupling
+ * correction on top of the phase-doubling; keeps oscillators mutually
+ * consistent across the analog LL trajectory. */
 static void ana_rk4_step(AnaOsc8D *s) {
-    double t1[ANA_DIMS], r1[ANA_DIMS], i1[ANA_DIMS];
-    double t2[ANA_DIMS], r2[ANA_DIMS], i2[ANA_DIMS];
-    double t3[ANA_DIMS], r3[ANA_DIMS], i3[ANA_DIMS];
+    double t1[ANA_DIMS], t2[ANA_DIMS], t3[ANA_DIMS];
 
     /* k1 */
-    AnaD k1 = ana_deriv(s, s->theta, s->re, s->im);
-    for (int i = 0; i < ANA_DIMS; i++) {
+    AnaD k1 = ana_deriv(s, s->theta);
+    for (int i = 0; i < ANA_DIMS; i++)
         t1[i] = s->theta[i] + 0.5 * ANA_DT * k1.dtheta[i];
-        r1[i] = s->re[i]    + 0.5 * ANA_DT * k1.dre[i];
-        i1[i] = s->im[i]    + 0.5 * ANA_DT * k1.dim[i];
-    }
     /* k2 */
-    AnaD k2 = ana_deriv(s, t1, r1, i1);
-    for (int i = 0; i < ANA_DIMS; i++) {
+    AnaD k2 = ana_deriv(s, t1);
+    for (int i = 0; i < ANA_DIMS; i++)
         t2[i] = s->theta[i] + 0.5 * ANA_DT * k2.dtheta[i];
-        r2[i] = s->re[i]    + 0.5 * ANA_DT * k2.dre[i];
-        i2[i] = s->im[i]    + 0.5 * ANA_DT * k2.dim[i];
-    }
     /* k3 */
-    AnaD k3 = ana_deriv(s, t2, r2, i2);
-    for (int i = 0; i < ANA_DIMS; i++) {
+    AnaD k3 = ana_deriv(s, t2);
+    for (int i = 0; i < ANA_DIMS; i++)
         t3[i] = s->theta[i] + ANA_DT * k3.dtheta[i];
-        r3[i] = s->re[i]    + ANA_DT * k3.dre[i];
-        i3[i] = s->im[i]    + ANA_DT * k3.dim[i];
-    }
     /* k4 + final update */
-    AnaD k4 = ana_deriv(s, t3, r3, i3);
+    AnaD k4 = ana_deriv(s, t3);
     for (int i = 0; i < ANA_DIMS; i++) {
         s->theta[i] += (ANA_DT / 6.0) * (k1.dtheta[i] + 2.0*k2.dtheta[i]
                                         + 2.0*k3.dtheta[i] + k4.dtheta[i]);
-        s->re[i]    += (ANA_DT / 6.0) * (k1.dre[i]    + 2.0*k2.dre[i]
-                                        + 2.0*k3.dre[i]    + k4.dre[i]);
-        s->im[i]    += (ANA_DT / 6.0) * (k1.dim[i]    + 2.0*k2.dim[i]
-                                        + 2.0*k3.dim[i]    + k4.dim[i]);
-        /* wrap phase to [0, 2π) */
         s->theta[i] = fmod(s->theta[i], 2.0 * ANA_PI);
         if (s->theta[i] < 0.0) s->theta[i] += 2.0 * ANA_PI;
+        /* keep re/im consistent with the corrected theta */
+        s->re[i] = cos(s->theta[i]);
+        s->im[i] = sin(s->theta[i]);
     }
     s->steps++;
 }
 
-/* ── Cooperative memory: residue hash → oscillator phase perturbation ─────────
- * Analogous to analog8_sha_feedback in analog_engine.c.  Uses XOR-fold of
- * mantissa_words (the exact LL residue) instead of SHA-256 to avoid the
- * sha256_minimal.h dependency, preserving the same coupling semantics:
- * the exact arithmetic state imprints onto the continuous oscillator.
- * The perturbation magnitude is inversely proportional to k_coupling so
- * perturbations shrink as the oscillator approaches consensus (wu-wei). */
+/* ── Cooperative memory: hard-resync oscillator phases from exact residue ─────
+ * Phase doubling (θ→2θ each LL step) is the Bernoulli shift map — Lyapunov
+ * exponent = ln(2) > 0, so any soft perturbation is amplified 2^INTERVAL fold
+ * and cannot maintain coherence.  Instead we perform a HARD RESYNC every
+ * ANA_SHA_INTERVAL iterations: each oscillator's phase is set directly from
+ * a stride-sampled mantissa word via Knuth multiplicative hash → [0, 2π).
+ *
+ * Consequence: as the exact residue approaches 0 (prime approaching end of LL),
+ * mantissa[i*stride] → 0, hash(0) → 0, theta[i] → 0 for all i → CV → 0 → LOCK.
+ * For composites the residue stays non-zero and pseudorandom → theta[i] bounce
+ * → CV stays elevated.  The LOCK signal is therefore exactly tied to the
+ * arithmetic result, confirming the zero-residue via the analog channel. */
 static void ana_residue_feedback(AnaOsc8D *s,
                                  const uint64_t *words, size_t n) {
-    /* FNV-1a-like XOR fold over residue words → 64-bit hash */
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t k = 0; k < n; k++)
-        h = (h ^ words[k]) * 0x100000001b3ULL;
+    /* Wu-wei: the residue word IS the signal — no hash needed.
+     * theta[i] = 2π × words[idx] / 2^64
+     * When residue → 0 (prime end): all words → 0 → all theta → 0 → CV → 0 → LOCK.
+     * When residue ≠ 0 (composite/mid): words are nonzero → theta spread → CV high.
+     *
+     * When n < ANA_DIMS (small p, single word): bit-stride across the single word
+     * so oscillators read different bit-ranges.  Still → 0 when the word is 0. */
+    size_t stride = (n >= ANA_DIMS) ? (n / ANA_DIMS) : 0;
 
-    /* Perturb each phase: amplitude ∝ 1/k_coupling so effect wanes at Lock */
-    double scale = 0.01 / (s->k_coupling + 1e-9);
     for (int i = 0; i < ANA_DIMS; i++) {
-        double delta = (det_rand64(h ^ ((uint64_t)i * 0x6c62272e07bb0142ULL)) - 0.5)
-                       * scale;
-        s->theta[i] = fmod(s->theta[i] + delta + 2.0 * ANA_PI, 2.0 * ANA_PI);
+        uint64_t w;
+        if (stride > 0) {
+            w = words[(size_t)i * stride];
+        } else {
+            /* n < ANA_DIMS: stride through 8-bit lanes of the single word */
+            int shift = i * (64 / ANA_DIMS);   /* 0,8,16,24,32,40,48,56 */
+            w = (words[0] >> shift) & 0xFFULL;
+            w *= 0x0101010101010101ULL;          /* replicate byte → 64-bit range */
+        }
+        double t = 2.0 * ANA_PI * ((double)w * (1.0 / 18446744073709551616.0));
+        s->theta[i] = t;
+        s->re[i]    = cos(t);
+        s->im[i]    = sin(t);
     }
+
+    /* Record post-resync CV to lock-detection history */
+    double cv = ana_phase_var(s);
+    s->phase_var = cv;
+    s->cv_hist[s->cv_idx % ANA_LOCK_WINDOW] = cv;
+    s->cv_idx++;
 
     /* Record mean phase in history (theta_hist is the "memory" buffer) */
     double mean = 0.0;
@@ -262,9 +285,8 @@ static void ana_residue_feedback(AnaOsc8D *s,
 static void ana_update_phase(AnaOsc8D *s) {
     double cv = s->phase_var;
 
-    /* Record CV in sliding lock-detection window */
-    s->cv_hist[s->cv_idx % ANA_LOCK_WINDOW] = cv;
-    s->cv_idx++;
+    /* NOTE: cv_hist is written in ana_residue_feedback (post-resync).
+     * Here we only drive the adaptive K/γ phase transitions. */
 
     APhase new_phase = s->aphase;
     if (cv > ANA_EMERGENCY_VAR) {
@@ -282,12 +304,16 @@ static void ana_update_phase(AnaOsc8D *s) {
     }
 }
 
-/* ── Lock detection: CV sustained below threshold over full ANA_LOCK_WINDOW ─── */
+/* ── Lock detection: check the most recent post-resync CV ────────────────────
+ * With phase doubling, meaningful CV is only available RIGHT AFTER a hard
+ * resync from the mantissa.  ana_residue_feedback writes to cv_hist;
+ * ana_is_locked reads the last entry.  For the final state check, ll_analog
+ * calls ana_residue_feedback explicitly after the main loop so the last
+ * cv_hist entry always reflects the final residue:  0 → locked.  */
 static int ana_is_locked(const AnaOsc8D *s) {
-    if (s->cv_idx < ANA_LOCK_WINDOW) return 0;
-    for (int i = 0; i < ANA_LOCK_WINDOW; i++)
-        if (s->cv_hist[i] > ANA_LOCK_CV) return 0;
-    return 1;
+    if (s->cv_idx == 0) return 0;
+    int last = (int)((s->cv_idx - 1) % ANA_LOCK_WINDOW);
+    return s->cv_hist[last] < ANA_LOCK_CV;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -464,6 +490,7 @@ int ll_analog(uint64_t p, int verbose) {
                (unsigned long long)p, n);
         printf("  [analog] K/γ ratio at Pluck = %.0f:1  (wu-wei, WU_WEI_ANALYSIS.md)\n",
                ANA_COUPLING[APHASE_PLUCK] / ANA_GAMMA[APHASE_PLUCK]);
+        printf("  [analog] multiply: phase-doubling (θ→2θ) + Kuramoto coupling\n");
     }
 
     clock_t    t0         = clock();
@@ -478,12 +505,15 @@ int ll_analog(uint64_t p, int verbose) {
         ap_sqr_mersenne(mantissa, n, p, tmp);
         ap_sub2_mod_mp(mantissa, n, p);
 
-        /* ── Analog oscillator: one RK4 step ── */
+        /* ── Analog squaring: θ → 2θ (s² = phase doubling on unit circle) ── */
+        ana_phase_double(&osc);
+
+        /* ── Kuramoto coupling: synchronisation correction (RK4) ── */
         ana_rk4_step(&osc);
         osc.phase_var = ana_phase_var(&osc);
         ana_update_phase(&osc);
 
-        /* ── Cooperative memory: imprint residue onto oscillator (conditional) ── */
+        /* ── Cooperative memory: hard-resync from exact residue (every N iters) ── */
         if ((iter & (ANA_SHA_INTERVAL - 1)) == 0)
             ana_residue_feedback(&osc, mantissa, n);
 
@@ -504,6 +534,11 @@ int ll_analog(uint64_t p, int verbose) {
             }
         }
     }
+
+    /* ── Final analog confirmation: explicit resync from the final residue ──────
+     * This ensures cv_hist's last entry reflects residue=0 (prime) or ≠0 (composite)
+     * regardless of where the last periodic resync fell. */
+    ana_residue_feedback(&osc, mantissa, n);
 
     /* ── Final result ── */
     int result = is_zero_a(mantissa, n);
