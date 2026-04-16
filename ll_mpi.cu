@@ -60,6 +60,9 @@
  * Below CPU_TH: schoolbook on MPI->words, single-threaded, exact.
  * Above CPU_TH: GPU-parallel schoolbook kernel k_sqr_limb, exact.         */
 #define CPU_TH   20000u   /* exponent p; n_words = ceil(p/64) <= 313 */
+/* Progress report interval in wall-clock seconds.  Checked once per
+ * iteration on the host-side CPU round-trip — zero GPU impact.        */
+#define PROGRESS_INTERVAL 30
 
 /* ── MPI - matches hdgl_bootloaderz.h field names and order exactly ──────── */
 typedef struct {
@@ -1082,7 +1085,22 @@ static int ll_gpu_ntt(uint64_t p, int verbose) {
     cudaMemcpy(d_x, h_x, (size_t)n * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
     uint64_t iters = p - 2;
+    time_t t_start_ntt = time(NULL);
+    time_t t_last_ntt  = t_start_ntt;
     for (uint64_t i = 0; i < iters; i++) {
+        /* progress report: once every PROGRESS_INTERVAL wall-clock seconds */
+        {
+            time_t t_now = time(NULL);
+            if (t_now - t_last_ntt >= PROGRESS_INTERVAL) {
+                double pct = 100.0 * (double)(i + 1) / (double)iters;
+                long elapsed = (long)(t_now - t_start_ntt);
+                long eta = (elapsed > 0) ? (long)((double)elapsed * (iters - i - 1) / (double)(i + 1)) : -1;
+                fprintf(stderr, "  [M_%llu NTT] iter %llu/%llu  %.1f%%  elapsed %lds  eta %lds\n",
+                        (unsigned long long)p, (unsigned long long)(i + 1),
+                        (unsigned long long)iters, pct, elapsed, eta);
+                t_last_ntt = t_now;
+            }
+        }
         /* 1. Expand limbs into 32-bit coefficients, zero-pad to L */
         k_expand_limbs<<<blk_exp, thr, 0, stream>>>(d_x, d_a, n, L);
 
@@ -1246,7 +1264,22 @@ static int ll_gpu_analog(uint64_t p, int verbose) {
     cudaMemcpy(d_x, h_x, n * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
     uint64_t iters = p - 2;
+    time_t t_start_ana = time(NULL);
+    time_t t_last_ana  = t_start_ana;
     for (uint64_t i = 0; i < iters; i++) {
+        /* progress report */
+        {
+            time_t t_now = time(NULL);
+            if (t_now - t_last_ana >= PROGRESS_INTERVAL) {
+                double pct = 100.0 * (double)(i + 1) / (double)iters;
+                long elapsed = (long)(t_now - t_start_ana);
+                long eta = (elapsed > 0) ? (long)((double)elapsed * (iters - i - 1) / (double)(i + 1)) : -1;
+                fprintf(stderr, "  [M_%llu analog] iter %llu/%llu  %.1f%%  elapsed %lds  eta %lds\n",
+                        (unsigned long long)p, (unsigned long long)(i + 1),
+                        (unsigned long long)iters, pct, elapsed, eta);
+                t_last_ana = t_now;
+            }
+        }
         k_sqr_warp32<<<warp_blocks_sqr, warp_thr_sqr, 0, stream_main>>>(
             d_x, d_lo, d_mi, d_hi, (int)n);
         k_assemble<<<fld_blocks, FOLD_THR, 0, stream_main>>>(
@@ -1630,7 +1663,23 @@ static int ll_gpu(uint64_t p, int verbose) {
     cudaMemcpy(d_x, h_x, n * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
     uint64_t iters = p - 2;
+    time_t t_start_gpu = time(NULL);
+    time_t t_last_gpu  = t_start_gpu;
     for (uint64_t i = 0; i < iters; i++) {
+        /* progress report: fired at most once per PROGRESS_INTERVAL seconds;
+         * time() is a single syscall — negligible vs the D2H round-trip.  */
+        {
+            time_t t_now = time(NULL);
+            if (t_now - t_last_gpu >= PROGRESS_INTERVAL) {
+                double pct = 100.0 * (double)(i + 1) / (double)iters;
+                long elapsed = (long)(t_now - t_start_gpu);
+                long eta = (elapsed > 0) ? (long)((double)elapsed * (iters - i - 1) / (double)(i + 1)) : -1;
+                fprintf(stderr, "  [M_%llu] iter %llu/%llu  %.1f%%  elapsed %lds  eta %lds\n",
+                        (unsigned long long)p, (unsigned long long)(i + 1),
+                        (unsigned long long)iters, pct, elapsed, eta);
+                t_last_gpu = t_now;
+            }
+        }
         /* GPU parallel squaring (warp-reduced, no atomics) + assembly */
         k_sqr_warp<<<warp_blocks_sqr, warp_thr_sqr, 0, stream_main>>>(
             d_x, d_lo, d_mi, d_hi, (int)n);
@@ -1699,6 +1748,8 @@ static int ll_gpu_persistent(uint64_t p, int verbose) {
 
     /* shared memory: smem_s[n_words] */
     size_t smem_bytes = (size_t)n * sizeof(uint64_t);
+    fprintf(stderr, "  [M_%llu persistent] running %d iters in single kernel launch — no per-iter progress\n",
+            (unsigned long long)p, iters);
     k_ll_persistent_block<<<1, BLOCK_SZ, smem_bytes>>>(
             d_s, d_lo, d_mi, d_hi, n, (int)p, iters);
     cudaDeviceSynchronize();
