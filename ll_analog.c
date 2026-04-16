@@ -18,12 +18,15 @@
  *     theta_hist[200]       — mean-phase history (ANG_PHASE_HIST)
  *     cv_hist[50]           — CV window for lock detection (ANG_LOCK_WINDOW)
  *
- * ── Cooperative (conditional) memory ──────────────────────────────────────
+ * ── Harmonic sync (cooperative memory) ────────────────────────────────────
  *   Every ANA_SHA_INTERVAL (=8) iterations:
- *     h = xor_fold(mantissa_words)  — deterministic hash of exact residue
- *     theta[i] += det_rand(h^i) * delta / k_coupling  — phase perturbation
- *   → the oscillator "remembers" the arithmetic trajectory via its phase
- *     history.  SHA-256-style imprint without the SHA-256 dependency.
+ *     T[i] = 2π × words[i·stride] / 2^64     (wu-wei: direct mapping, no hash)
+ *     θ[i] → θ[i] + α·atan2(sin(T[i]−θ[i]), cos(T[i]−θ[i]))   × PASSES iters
+ *   Convergence: residual error = (1−α)^PASSES × initial ≈ 0.005 rad per call.
+ *   → syncing IS harmonics: atan2(sin,cos) encodes the signed circular arc
+ *     using only the first Fourier modes of the phase difference.
+ *   Prime end: T[i]→0 → θ[i]→0 → CV→0 → LOCK.
+ *   Composite: T[i] spread → no consensus → CV high.
  *
  * ── Adaptive phase (K/γ wu-wei ratios from WU_WEI_ANALYSIS.md) ───────────
  *   Pluck:    K=5.0 γ=0.005  (1000:1) — rapid excitation, high energy
@@ -64,30 +67,38 @@
 #define ANA_DT           0.01        /* integration timestep */
 #define ANA_PHI          1.6180339887498948
 #define ANA_PI           3.14159265358979323846
-#define ANA_SHA_INTERVAL 8           /* ANG_SHA_INTERVAL: feedback every N iters */
+#define ANA_SHA_INTERVAL 8           /* ANG_SHA_INTERVAL: sync every N iters */
+#define ANA_HARM_ALPHA  0.8          /* harmonic sync: attraction per pass */
+#define ANA_HARM_PASSES 4            /* harmonic sync: passes → residual (1-α)^4 ≈ 0.002 */
 
 /* Phase transition CV thresholds (analog_engine.h ANG_CV_TO_*) */
 #define ANA_CV_TO_SUSTAIN    0.50
 #define ANA_CV_TO_FINETUNE   0.30
 #define ANA_CV_TO_LOCK       0.10
-#define ANA_EMERGENCY_VAR   10.0
+#define ANA_EMERGENCY_VAR   1.5   /* > 1.0 impossible for 1-R; sentinel */
 
 /* K/γ ratios: Pluck=1000:1, critical insight from WU_WEI_ANALYSIS.md.
  * Matching APHASE_COUPLING[] and APHASE_GAMMA[] in analog_engine.c. */
 static const double ANA_GAMMA[4]    = {0.005, 0.008, 0.010, 0.012};
 static const double ANA_COUPLING[4] = {5.0,   3.0,   2.0,   1.8};
 
-/* Base(∞) φ-seeds for natural frequencies (analog_engine.c BASE_INF_SEEDS).
- * omega[i] = BASE_INF_SEEDS[i] * ANA_DT  (radians/step at dt=0.01) */
-static const double BASE_INF_SEEDS[ANA_DIMS] = {
-    1.6180339887,   /* φ¹  D₁ */
-    2.6180339887,   /* φ²  D₂ */
-    3.6180339887,   /* φ³  D₃ */
-    4.8541019662,   /* φ⁴  D₄ */
-    5.6180339887,   /* φ⁵  D₅ */
-    6.4721359549,   /* φ⁶  D₆ */
-    7.8541019662,   /* φ⁷  D₇ */
-    8.3141592654,   /* φ⁸  D₈ */
+/* HDGL Seed Glyph — 20-component self-describing vector (Seed_Vector_Chain_Reaction).
+ * Rows: spatial(0-3), symbolic(4-5), harmonic(6-9), physical(10-17), recursive(18-19).
+ *
+ * Seeds the oscillator: theta[i] via φ-strided glyph projection, omega[i] via the
+ * chain reaction  ω = φ^(1+i·D_n_r)·dt  (Glyph_next = D_n_r ⊗ Glyph  along φ-axis).
+ * Each prime p maps to a unique glyph slice:  p_phase = D_n_r·p mod 1.
+ *
+ * Component 18: D_n_r = 0.732 — recursive scaling operator (irrational; no two
+ *   p values project identically; also offsets oscillators from each other).
+ * Component 6:  φ = 1.618... — harmonic base for the ω chain reaction. */
+static const double HDGL_GLYPH[20] = {
+    0.618,                0.618, 0.618, 1.0,    /* 0-3:  X, Y, Z, M  (spatial) */
+    0.123,                0.456,                /* 4-5:  ΔDNA, ΔBase4096 (symbolic) */
+    1.6180339887498948,   1.0,   2.0,   2.0,   /* 6-9:  φ, F_n, P_n, 2^n (harmonic) */
+    0.618,  0.236,  0.142, 0.445,               /* 10-13: s, C, Ω, m (physical) */
+    0.015,  0.024,  0.053, 0.056,               /* 14-17: h, E, F, V (physical) */
+    0.732,  1.0,                                /* 18-19: D_n_r, k (recursive) */
 };
 
 /* ── Adaptive phase state (matches APhase in analog_engine.h) ─────────────── */
@@ -117,44 +128,53 @@ typedef struct {
     int    steps;                         /* total RK4 steps taken            */
 } AnaOsc8D;
 
-/* ── Deterministic pseudo-random (mirrors det_rand in AnalogContainer1) ─────── */
-static inline double det_rand64(uint64_t seed) {
-    uint64_t x = seed;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    return (double)(x * 0x2545F4914F6CDD1DULL) / 18446744073709551615.0;
+/* ── Circular order parameter: CV = 1 − R ───────────────────────────────────
+ * R = |mean(e^{iθ})| ∈ [0,1]: Kuramoto coherence measure.
+ *   R = 1: all phases coincide → CV = 0 (LOCK).
+ *   R = 0: phases uniformly spread → CV = 1 (maximal disorder).
+ *
+ * Uses re[i]=cos(θ[i]) and im[i]=sin(θ[i]) already maintained in AnaOsc8D.
+ * Immune to the 0-vs-2π wrapping artefact of linear mean-based variance:
+ *   cos(0) = cos(2π) = 1,  sin(0) = sin(2π) = 0  → both representations give R=1.
+ * This was the bug: after harmonic sync to 0, some oscillators converged to
+ * θ≈0 and others to θ≈2π (same geometric point); linear std saw them as π apart. */
+static double ana_phase_var(const AnaOsc8D *s) {
+    double rx = 0.0, ry = 0.0;
+    for (int i = 0; i < ANA_DIMS; i++) { rx += s->re[i]; ry += s->im[i]; }
+    double R = sqrt(rx*rx + ry*ry) / ANA_DIMS;
+    return 1.0 - R;   /* 0 = locked, 1 = maximally spread */
 }
 
-/* ── Oscillator initialisation ───────────────────────────────────────────────── */
-static void ana_init(AnaOsc8D *s, uint64_t seed) {
+/* ── Oscillator initialisation — HDGL glyph chain reaction ──────────────────
+ * Replaces det_rand64 + BASE_INF_SEEDS (digital thinking) with the HDGL glyph.
+ *
+ * theta[i]: φ-strided projection of glyph + p-modulation + i×D_n_r offset.
+ *   gi = floor(i×φ×7) mod 20  samples across all glyph rows.
+ *   Raw value = glyph[gi] + D_n_r×p mod 1 + i×D_n_r  (then ×2π).
+ *   The i×D_n_r term is the recursive offset — the chain reaction step that
+ *   separates same-value components (e.g. X=Z=0.618 at i=0,2).
+ *
+ * omega[i]: chain reaction along the harmonic (φ) axis:
+ *   ω[i] = φ^(1 + i×D_n_r) × dt    ← Glyph_next = D_n_r ⊗ Glyph
+ *   Irrationally spaced, naturally increasing; purely analog origin. */
+static void ana_init(AnaOsc8D *s, uint64_t p) {
     memset(s, 0, sizeof(*s));
     s->aphase     = APHASE_PLUCK;
     s->gamma      = ANA_GAMMA[APHASE_PLUCK];
     s->k_coupling = ANA_COUPLING[APHASE_PLUCK];
-    s->phase_var  = 1e6;
+    s->phase_var  = 1.0;   /* valid initial value for 1-R in [0,1] */
+
+    double p_phase = fmod((double)p * HDGL_GLYPH[18], 1.0);  /* D_n_r × p mod 1 */
     for (int i = 0; i < ANA_DIMS; i++) {
-        s->omega[i] = BASE_INF_SEEDS[i] * ANA_DT;
-        /* stagger initial phases deterministically from p-seeded entropy */
-        s->theta[i] = 2.0 * ANA_PI * det_rand64(seed ^ ((uint64_t)i * 0x9e3779b97f4a7c15ULL));
+        /* Glyph indices for i=0..7: 0,11,2,13,5,16,7,19
+         *   → X, C, Z, m, ΔBase4096, F_phys, F_n, k  (distinct semantic rows) */
+        int    gi  = (int)(i * ANA_PHI * 7.0) % 20;
+        double raw = fmod(HDGL_GLYPH[gi] + p_phase + i * HDGL_GLYPH[18], 1.0);
+        s->theta[i] = 2.0 * ANA_PI * raw;
         s->re[i]    = cos(s->theta[i]);
         s->im[i]    = sin(s->theta[i]);
+        s->omega[i] = pow(ANA_PHI, 1.0 + i * HDGL_GLYPH[18]) * ANA_DT;
     }
-}
-
-/* ── Phase variance ──────────────────────────────────────────────────────────── */
-static double ana_phase_var(const AnaOsc8D *s) {
-    double mean = 0.0;
-    for (int i = 0; i < ANA_DIMS; i++) mean += s->theta[i];
-    mean /= ANA_DIMS;
-    double var = 0.0;
-    for (int i = 0; i < ANA_DIMS; i++) {
-        double d = s->theta[i] - mean;
-        while (d >  ANA_PI) d -= 2.0 * ANA_PI;
-        while (d < -ANA_PI) d += 2.0 * ANA_PI;
-        var += d * d;
-    }
-    return sqrt(var / ANA_DIMS);
 }
 
 /* ── RK4 derivative struct (Kuramoto phase coupling only) ──────────────────── */
@@ -227,56 +247,69 @@ static void ana_rk4_step(AnaOsc8D *s) {
     s->steps++;
 }
 
-/* ── Cooperative memory: hard-resync oscillator phases from exact residue ─────
- * Phase doubling (θ→2θ each LL step) is the Bernoulli shift map — Lyapunov
- * exponent = ln(2) > 0, so any soft perturbation is amplified 2^INTERVAL fold
- * and cannot maintain coherence.  Instead we perform a HARD RESYNC every
- * ANA_SHA_INTERVAL iterations: each oscillator's phase is set directly from
- * a stride-sampled mantissa word via Knuth multiplicative hash → [0, 2π).
+/* ── Harmonic sync: attract oscillators toward residue-derived target phases ──
  *
- * Consequence: as the exact residue approaches 0 (prime approaching end of LL),
- * mantissa[i*stride] → 0, hash(0) → 0, theta[i] → 0 for all i → CV → 0 → LOCK.
- * For composites the residue stays non-zero and pseudorandom → theta[i] bounce
- * → CV stays elevated.  The LOCK signal is therefore exactly tied to the
- * arithmetic result, confirming the zero-residue via the analog channel. */
-static void ana_residue_feedback(AnaOsc8D *s,
-                                 const uint64_t *words, size_t n) {
-    /* Wu-wei: the residue word IS the signal — no hash needed.
-     * theta[i] = 2π × words[idx] / 2^64
-     * When residue → 0 (prime end): all words → 0 → all theta → 0 → CV → 0 → LOCK.
-     * When residue ≠ 0 (composite/mid): words are nonzero → theta spread → CV high.
-     *
-     * When n < ANA_DIMS (small p, single word): bit-stride across the single word
-     * so oscillators read different bit-ranges.  Still → 0 when the word is 0. */
+ * Syncing IS harmonics.  The Kuramoto term  K·sin(θⱼ−θᵢ)  is the first
+ * Fourier harmonic of the phase difference.  This function extends that same
+ * principle to the residue→oscillator coupling: instead of a hard overwrite
+ * (K→∞), we use a finite harmonic attraction in the atan2 form:
+ *
+ *   Δθᵢ = α · atan2(sin(Tᵢ − θᵢ), cos(Tᵢ − θᵢ))
+ *
+ * atan2(sin·, cos·) is the signed shortest-arc distance on the circle,
+ * expressed entirely through the first Fourier harmonics (sin, cos).
+ * Over ANA_HARM_PASSES iterations at ANA_HARM_ALPHA = 0.8:
+ *   residual error = (1−0.8)^4 × π_max ≈ 0.002 × π ≈ 0.006 rad
+ *
+ * Wu-wei: Tᵢ = 2π × words[i·stride] / 2^64  (direct mapping, no hash).
+ * Prime end: all words→0 → Tᵢ→0 → θᵢ→0 → CV→0 → LOCK.
+ * Composite: words spread → Tᵢ spread → θᵢ spread → CV high. */
+static void ana_harmonic_sync(AnaOsc8D *s,
+                              const uint64_t *words, size_t n) {
+    double theta_target[ANA_DIMS];
     size_t stride = (n >= ANA_DIMS) ? (n / ANA_DIMS) : 0;
 
+    /* Wu-wei: residue word → target phase (direct, no hash) */
     for (int i = 0; i < ANA_DIMS; i++) {
         uint64_t w;
         if (stride > 0) {
             w = words[(size_t)i * stride];
         } else {
-            /* n < ANA_DIMS: stride through 8-bit lanes of the single word */
+            /* n < ANA_DIMS: bit-stride across 8-bit lanes of single word */
             int shift = i * (64 / ANA_DIMS);   /* 0,8,16,24,32,40,48,56 */
             w = (words[0] >> shift) & 0xFFULL;
-            w *= 0x0101010101010101ULL;          /* replicate byte → 64-bit range */
+            w *= 0x0101010101010101ULL;          /* replicate byte → full 64-bit range */
         }
-        double t = 2.0 * ANA_PI * ((double)w * (1.0 / 18446744073709551616.0));
-        s->theta[i] = t;
-        s->re[i]    = cos(t);
-        s->im[i]    = sin(t);
+        theta_target[i] = 2.0 * ANA_PI * ((double)w * (1.0 / 18446744073709551616.0));
     }
 
-    /* Record post-resync CV to lock-detection history */
+    /* Harmonic attraction: α·atan2(sin(T−θ), cos(T−θ)) for ANA_HARM_PASSES passes.
+     * atan2(sin·, cos·) = signed circular-arc distance in (−π, π].
+     * This is purely harmonic: only sin and cos of the phase difference are used.
+     * After P passes at α: residual ≤ (1−α)^P × |initial_error|. */
+    for (int pass = 0; pass < ANA_HARM_PASSES; pass++) {
+        for (int i = 0; i < ANA_DIMS; i++) {
+            double diff = atan2(sin(theta_target[i] - s->theta[i]),
+                                cos(theta_target[i] - s->theta[i]));
+            s->theta[i] += ANA_HARM_ALPHA * diff;
+            s->theta[i]  = fmod(s->theta[i] + 4.0 * ANA_PI, 2.0 * ANA_PI);
+        }
+    }
+    for (int i = 0; i < ANA_DIMS; i++) {
+        s->re[i] = cos(s->theta[i]);
+        s->im[i] = sin(s->theta[i]);
+    }
+
+    /* Record post-sync CV to lock-detection history */
     double cv = ana_phase_var(s);
     s->phase_var = cv;
     s->cv_hist[s->cv_idx % ANA_LOCK_WINDOW] = cv;
     s->cv_idx++;
 
-    /* Record mean phase in history (theta_hist is the "memory" buffer) */
+    /* Record mean phase in theta_hist (cooperative memory buffer) */
     double mean = 0.0;
     for (int i = 0; i < ANA_DIMS; i++) mean += s->theta[i];
-    mean /= ANA_DIMS;
-    s->theta_hist[s->hist_idx % ANA_PHASE_HIST] = mean;
+    s->theta_hist[s->hist_idx % ANA_PHASE_HIST] = mean / ANA_DIMS;
     s->hist_idx++;
 }
 
@@ -510,14 +543,17 @@ int ll_analog(uint64_t p, int verbose) {
 
     /* ── Initialise 8D Kuramoto oscillator ── */
     AnaOsc8D osc;
-    ana_init(&osc, (uint64_t)p * 0x9e3779b97f4a7c15ULL);
+    ana_init(&osc, p);   /* glyph chain reaction seeds theta[i] and omega[i] */
 
     if (verbose) {
         printf("  [analog] p=%llu  n_words=%zu  osc=8D-Kuramoto\n",
                (unsigned long long)p, n);
-        printf("  [analog] K/γ ratio at Pluck = %.0f:1  (wu-wei, WU_WEI_ANALYSIS.md)\n",
-               ANA_COUPLING[APHASE_PLUCK] / ANA_GAMMA[APHASE_PLUCK]);
-        printf("  [analog] multiply: phase-doubling (θ→2θ) + Kuramoto coupling\n");
+        printf("  [analog] seed:     HDGL glyph (20 components), p_phase=D_n_r*p mod 1\n");
+        printf("  [analog] omega:    phi^(1+i*D_n_r)*dt  [chain reaction, harmonic axis]\n");
+        printf("  [analog] CV:       Kuramoto 1-R in [0,1]  (circular; 0=locked, 1=spread)\n");
+        printf("  [analog] multiply: phase-doubling (theta->2theta) + Kuramoto coupling\n");
+        printf("  [analog] sync:     harmonic attraction alpha=%.1fx%d (atan2, first Fourier modes)\n",
+               ANA_HARM_ALPHA, ANA_HARM_PASSES);
     }
 
     clock_t    t0         = clock();
@@ -540,9 +576,9 @@ int ll_analog(uint64_t p, int verbose) {
         osc.phase_var = ana_phase_var(&osc);
         ana_update_phase(&osc);
 
-        /* ── Cooperative memory: hard-resync from exact residue (every N iters) ── */
+        /* ── Harmonic sync: attract oscillators toward residue-derived phases ── */
         if ((iter & (ANA_SHA_INTERVAL - 1)) == 0)
-            ana_residue_feedback(&osc, mantissa, n);
+            ana_harmonic_sync(&osc, mantissa, n);
 
         /* ── Progress: only log on natural phase transitions (wu-wei pacing) ── */
         if (verbose) {
@@ -562,10 +598,10 @@ int ll_analog(uint64_t p, int verbose) {
         }
     }
 
-    /* ── Final analog confirmation: explicit resync from the final residue ──────
-     * This ensures cv_hist's last entry reflects residue=0 (prime) or ≠0 (composite)
-     * regardless of where the last periodic resync fell. */
-    ana_residue_feedback(&osc, mantissa, n);
+    /* ── Final analog confirmation: harmonic sync on final residue ────────────
+     * Ensures cv_hist's last entry reflects residue=0 (prime) or ≠0 (composite)
+     * regardless of where the last periodic sync fell. */
+    ana_harmonic_sync(&osc, mantissa, n);
 
     /* ── Final result ── */
     int result = is_zero_a(mantissa, n);
