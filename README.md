@@ -121,22 +121,45 @@ CPU sub-2 mod M_p → h_x
   d_x ◄──── H2D upload ─── h_x
 ```
 
-### Five Dispatch Paths (auto-select enabled)
+### Six Dispatch Paths (auto-select enabled)
 
 | Path | Range | Flag | Notes |
 |------|-------|------|-------|
 | `ll_small` | p ≤ 62 | — | `unsigned __int128`, direct fold |
 | `ll_cpu` | 62 < p ≤ 20 000 | — | Schoolbook MPI, `__int128` carry |
-| `ll_gpu` | p > 20 000 | **auto, p < 400 000** | `k_sqr_warp` 64-bit warp shuffle + CPU fold |
+| `ll_gpu_gpucarry` | p > 20 000 | **auto, p < 400 000** | `k_sqr_warp` + on-device parallel carry scan + shmem fold, CUDA graph — **fastest schoolbook-complexity path** |
 | `ll_gpu_ntt` | p > 20 000 | **auto, p ≥ 400 000** · or `--squaring ntt` | `k_ntt_butterfly` + `k_ntt_sqr` — O(n log n) NTT over Z/(2⁶⁴−2³²+1), exact |
+| `ll_gpu` | p > 20 000 | `--squaring schoolbook` | `k_sqr_warp` 64-bit warp shuffle + CPU fold (PCIe round-trip per iteration) |
 | `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
 
-### Benchmarks (RTX 2060, sm_75, April 2026, `feature/ntt-full`)
+### Benchmarks (RTX 2060, sm_75, April 2026, `feature/gpu-carry`)
 
-75/75 selftest pass across all three paths (default, `--squaring ntt`, `--precision 32`).
+75/75 selftest pass across all paths (default gpucarry, `--squaring ntt`, `--squaring schoolbook`, `--precision 32`).
 
-**Default stream path (`ll_gpu` — `k_sqr_warp` + CPU fold):**
+**GPU-carry path (`ll_gpu_gpucarry` — default for p < 400 000):**
+
+| Exponent p | Words n | Iterations | Time | vs schoolbook | vs NTT |
+|------------|---------|-----------|------|---------------|--------|
+| 21 701 | 340 | 21 699 | **1.2 s** | 3.1× faster | 4.4× faster |
+| 44 497 | 696 | 44 495 | **3.4 s** | 2.1× faster | 3.1× faster |
+| 86 243 | 1 348 | 86 241 | **11.7 s** | 1.3× faster | 2.0× faster |
+| 110 503 | 1 727 | 110 501 | **19.2 s** | 1.15× faster | 1.6× faster |
+
+Speedup source: eliminates the PCIe D2H+H2D round-trip (~100µs/iteration on Windows/WDDM)
+as a zero-kernel-overhead CUDA graph, replacing it with:
+1. **Parallel carry scan** (`k_carry_lscan` + `k_carry_bscan<<<1,1>>>` + `k_carry_apply`) —
+   wu-wei function-composition prefix scan: each limb$k$ expresses its carry-transfer function
+   $f_k(c) = \lfloor(\text{flat}[k]+c)/2^{64}\rfloor + \text{ovf}[k]$ as a packed 4-entry table;
+   Kogge-Stone composition over 2$n$ elements gives all $c_{\text{in}}[k]$ in parallel.
+2. **Shmem fold** (`k_fold_sub2_gpu<<<1, 256, n2×8\ \text{bytes}>>>`) — 256 threads
+   cooperatively preload the 2$n$-word flat product into shared memory; thread 0 folds
+   at ~4-cycle shmem latency vs ~300-cycle global-memory latency (single-thread path).
+
+All six kernels (`k_sqr_warp`, `k_assemble`, `k_carry_lscan`, `k_carry_bscan`, `k_carry_apply`,
+`k_fold_sub2_gpu`) captured in a single CUDA graph — one `cudaGraphLaunch` per iteration.
+
+**Schoolbook path (`--squaring schoolbook` — `ll_gpu`, CPU fold, PCIe round-trip):**
 
 | Exponent p | Words n | Iterations | Time |
 |------------|---------|-----------|------|
@@ -144,9 +167,6 @@ CPU sub-2 mod M_p → h_x
 | 44 497 | 696 | 44 495 | **7.3 s** |
 | 86 243 | 1 348 | 86 241 | **14.9 s** |
 | 110 503 | 1 727 | 110 501 | **22.1 s** |
-
-Speedup grows with p because larger n means longer warp inner loops — the 32-lane
-warp reduction provides a larger multiplier on the serial inner-product bottleneck.
 
 **NTT path (`--squaring ntt` — O(n log n) squaring over Z/QZ):**
 
@@ -271,9 +291,10 @@ ll_mpi.exe <p> --verbose                # timing + resonance report
 ll_mpi.exe <p> --precision 64           # 64-bit warp squaring via __int128 (default)
 ll_mpi.exe <p> --precision 32           # 32-bit half-multiply decomposition
 ll_mpi.exe <p> --analog                 # legacy alias for --precision 32
-ll_mpi.exe <p> --squaring auto          # auto-select: schoolbook if p < 400000, NTT if p ≥ 400000 (default)
-ll_mpi.exe <p> --squaring schoolbook    # force O(n²) schoolbook multiply
-ll_mpi.exe <p> --squaring ntt           # force O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
+ll_mpi.exe <p> --squaring auto          # auto-select: gpucarry if p < 400000, NTT if p ≥ 400000 (default)
+ll_mpi.exe <p> --squaring gpucarry     # on-device carry scan + shmem fold, no PCIe round-trip
+ll_mpi.exe <p> --squaring schoolbook   # force O(n²) schoolbook + CPU fold (PCIe round-trip)
+ll_mpi.exe <p> --squaring ntt          # force O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
 ll_mpi.exe <p> --persistent             # single kernel, all iterations on-device
 ll_mpi.exe --gpu-info                   # list CUDA devices
 ```

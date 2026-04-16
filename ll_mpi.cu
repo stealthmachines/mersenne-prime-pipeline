@@ -1725,6 +1725,263 @@ static void cpu_fold_sub2(uint64_t *h_flat, const uint8_t *h_ovf,
     }
 }
 
+/* ── GPU parallel carry: wu-wei function-composition prefix scan ─────────
+ *
+ * Each limb position k has a carry-transfer function f_k: {0,1,2,3}→{0,1,2,3}
+ *   f_k(c) = floor((d_flat[k] + c) / 2^64) + d_ovf[k]
+ * packed into a uint8_t (bits [2c+1:2c] = f_k(c), c = 0..3).
+ *
+ * Parallel carry_in[k] = (f_{k-1} ∘ … ∘ f_0)(0) — exclusive prefix at 0.
+ * Three-kernel pipeline: lscan (block prefixes) → bscan (block carry-ins,
+ * <<<1,1>>>) → apply (update d_flat in-place) → fold/sub2 (<<<1,1>>>).
+ *
+ * Eliminates PCIe D2H+H2D round-trip (~120-200 µs/iter on WDDM) with a
+ * GPU-only prefix scan (~5-10 µs/iter). Captured in a CUDA graph.
+ *
+ * Wu-wei principle (fold26_wuwei): each thread expreses its own carry
+ * function independently; composition is associative — let the data
+ * determine its path through the prefix tree.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+#define CFUNC_ID  0xE4u   /* identity: f(c)=c → 0|1<<2|2<<4|3<<6        */
+#define CARRY_BLK 256     /* threads per block for carry kernels          */
+#define CARRY_WPB (CARRY_BLK / 32)  /* warps per block = 8                */
+
+/* Apply packed carry function: f(c) */
+static __device__ __forceinline__ uint8_t cfa(uint8_t f, uint8_t c) {
+    return (f >> (c << 1)) & 3u;
+}
+/* Compose packed carry functions: (b∘a)(c) = b(a(c)) */
+static __device__ __forceinline__ uint8_t cfc(uint8_t b, uint8_t a) {
+    return (uint8_t)(  cfa(b, cfa(a, 0))
+                    | (cfa(b, cfa(a, 1)) << 2)
+                    | (cfa(b, cfa(a, 2)) << 4)
+                    | (cfa(b, cfa(a, 3)) << 6));
+}
+/* Build packed carry function from (flat_k, ovf_k):
+ * f_k(c) = (flat_k + c overflows 64 bits ? 1 : 0) + ovf_k          */
+static __device__ __forceinline__ uint8_t cfm(uint64_t flat, uint8_t ovf) {
+    /* c=0: no overflow ever (flat ≤ UINT64_MAX)                             */
+    /* c=1: overflow iff flat == 0xFFFF…F                                   */
+    /* c=2: overflow iff flat >= 0xFFFF…E                                   */
+    /* c=3: overflow iff flat >= 0xFFFF…D                                   */
+    uint8_t bc1 = (flat == 0xFFFFFFFFFFFFFFFFULL) ? 1u : 0u;
+    uint8_t bc2 = (flat >= 0xFFFFFFFFFFFFFFFEULL) ? 1u : 0u;
+    uint8_t bc3 = (flat >= 0xFFFFFFFFFFFFFFFDULL) ? 1u : 0u;
+    return  (       ovf        & 3u)
+         | (((bc1 + ovf) & 3u) << 2)
+         | (((bc2 + ovf) & 3u) << 4)
+         | (((bc3 + ovf) & 3u) << 6);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * k_carry_lscan — block-level exclusive prefix scan over carry functions.
+ * Output d_lpfx[k]   : exclusive prefix within block (identity at k=blk_start).
+ * Output d_bagg[blkId]: inclusive block aggregate function.
+ * ───────────────────────────────────────────────────────────────────────── */
+__global__ void k_carry_lscan(
+        const uint64_t * __restrict__ d_flat,
+        const uint8_t  * __restrict__ d_ovf,
+        uint8_t        * __restrict__ d_lpfx,   /* n2 bytes out */
+        uint8_t        * __restrict__ d_bagg,   /* nblocks bytes out */
+        int n2)
+{
+    __shared__ uint8_t s_wagg[CARRY_WPB];  /* warp inclusive aggregates (8) */
+    __shared__ uint8_t s_wpfx[CARRY_WPB];  /* warp exclusive prefix (8)     */
+
+    int tid  = (int)threadIdx.x;
+    int k    = (int)(blockIdx.x * blockDim.x) + tid;
+    int lane = tid & 31;
+    int wid  = tid >> 5;
+
+    /* Step 1: local carry function (identity for out-of-bounds) */
+    uint8_t fk = (k < n2) ? cfm(d_flat[k], d_ovf[k]) : CFUNC_ID;
+
+    /* Step 2: warp-level inclusive scan via shuffle */
+    uint8_t wincl = fk;
+    for (int s = 1; s <= 16; s <<= 1) {
+        uint8_t prev = (uint8_t)__shfl_up_sync(0xFFFFFFFFu, (unsigned)wincl, s);
+        if (lane >= s) wincl = cfc(wincl, prev);
+    }
+    /* wincl = f_{wbase+lane} ∘ … ∘ f_{wbase}  (inclusive) */
+
+    /* Exclusive per-lane: shift right by 1 */
+    uint8_t wexcl = (uint8_t)__shfl_up_sync(0xFFFFFFFFu, (unsigned)wincl, 1);
+    if (lane == 0) wexcl = CFUNC_ID;
+
+    /* Step 3: store warp aggregate (inclusive of last real lane in warp) */
+    if (lane == 31) s_wagg[wid] = wincl;
+    __syncthreads();
+
+    /* Step 4: warp 0 scans the 8 warp aggregates */
+    if (wid == 0) {
+        uint8_t wf = (lane < CARRY_WPB) ? s_wagg[lane] : CFUNC_ID;
+        /* inclusive scan over 8 warps using lanes 0..7 */
+        for (int s = 1; s <= 4; s <<= 1) {
+            uint8_t prev = (uint8_t)__shfl_up_sync(0xFFFFFFFFu, (unsigned)wf, s);
+            if (lane >= s) wf = cfc(wf, prev);
+        }
+        /* exclusive: shift right by 1 */
+        uint8_t wepfx = (uint8_t)__shfl_up_sync(0xFFFFFFFFu, (unsigned)wf, 1);
+        if (lane == 0) wepfx = CFUNC_ID;
+        if (lane < CARRY_WPB) s_wpfx[lane] = wepfx;
+        /* block aggregate = inclusive of last warp (lane CARRY_WPB-1) */
+        if (lane == CARRY_WPB - 1) d_bagg[blockIdx.x] = wf;
+    }
+    __syncthreads();
+
+    /* Step 5: combine warp exclusive prefix + per-lane exclusive = block-exclusive.
+     * We want: carry_in[k] = apply(chain, 0) where chain first applies
+     * s_wpfx[wid] (all warps before mine), then wexcl (my warp before my lane).
+     * cfc(b,a)(c) = b(a(c)), so cfc(wexcl, s_wpfx[wid]) applies s_wpfx first. */
+    uint8_t blk_excl = cfc(wexcl, s_wpfx[wid]);
+    if (k < n2) d_lpfx[k] = blk_excl;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * k_carry_bscan — <<<1,1>>>: serial scan over block aggregates.
+ * Writes per-block carry-in (uint8_t) and total top carry (1 byte).
+ * ───────────────────────────────────────────────────────────────────────── */
+__global__ void k_carry_bscan(
+        const uint8_t * __restrict__ d_bagg,
+        uint8_t       * __restrict__ d_bcarry,   /* nblocks bytes out */
+        uint8_t       * __restrict__ d_topcarry, /* 1 byte out        */
+        int nblocks)
+{
+    uint8_t carry = 0u;
+    for (int b = 0; b < nblocks; b++) {
+        d_bcarry[b] = carry;
+        carry = cfa(d_bagg[b], carry);
+    }
+    d_topcarry[0] = carry;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * k_carry_apply — apply per-element carry-ins and update d_flat in-place.
+ *   carry_in[k] = apply(d_lpfx[k], d_bcarry[blockIdx.x])
+ *   d_flat[k]  += carry_in[k]   (unsigned mod 2^64 — intentional wrap)
+ * ───────────────────────────────────────────────────────────────────────── */
+__global__ void k_carry_apply(
+        uint64_t       * __restrict__ d_flat,
+        const uint8_t  * __restrict__ d_lpfx,
+        const uint8_t  * __restrict__ d_bcarry,
+        int n2)
+{
+    int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (k >= n2) return;
+    uint8_t cin = cfa(d_lpfx[k], d_bcarry[blockIdx.x]);
+    d_flat[k] += (uint64_t)cin;   /* correct mod-2^64 low word of (orig+carry) */
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * k_fold_sub2_gpu — fold carry-propagated flat array mod 2^p-1, subtract 2.
+ *
+ * Launched as <<<1, CARRY_BLK, n2*sizeof(uint64_t)>>>.
+ * All CARRY_BLK threads cooperatively load d_flat into shared memory
+ * (parallel global→L1/shmem at ~full bandwidth).  Thread 0 then executes
+ * the serial fold from shared memory at ~4-cycle-per-word shmem speed
+ * (vs ~300-cycle global memory latency per sequential dependent load).
+ * ───────────────────────────────────────────────────────────────────────── */
+__global__ void k_fold_sub2_gpu(
+        const uint64_t * __restrict__ d_flat,
+        const uint8_t  * __restrict__ d_topcarry,
+        uint64_t       * __restrict__ d_x,
+        int n_words, int p_exp)
+{
+    /* Cooperative parallel load: all CARRY_BLK threads fill shmem.
+     * Skipped when blockDim.x == 1 (shmem limit fallback). */
+    extern __shared__ uint64_t s_flat[];
+    int n  = n_words;
+    int n2 = 2 * n;
+
+    if (blockDim.x > 1) {
+        for (int i = (int)threadIdx.x; i < n2; i += (int)blockDim.x)
+            s_flat[i] = d_flat[i];
+        __syncthreads();
+    }
+
+    /* Thread 0 folds.  Read from shmem (fast) if cooperative, d_flat otherwise. */
+    if (threadIdx.x == 0) {
+        const uint64_t *src = (blockDim.x > 1) ? s_flat : d_flat;
+        int pw = p_exp / 64;
+        int pb = p_exp % 64;
+        uint64_t fc = (uint64_t)d_topcarry[0];
+
+        /* Fold lo-half into d_x */
+        for (int k = 0; k < n;  k++) d_x[k] = 0;
+        for (int k = 0; k < pw && k < n2; k++) d_x[k] = src[k];
+        if (pb > 0 && pw < n2 && pw < n)
+            d_x[pw] = src[pw] & ((1ULL << pb) - 1ULL);
+
+        /* Add hi-half shifted right by pb through bit boundary at pw */
+        for (int k = 0; k < n + 2; k++) {
+            int bi = pw + k;
+            uint64_t hw;
+            if (pb == 0) {
+                hw = (bi < n2) ? src[bi] : 0;
+            } else {
+                uint64_t lo = (bi   < n2) ? src[bi]   : 0;
+                uint64_t hi = (bi+1 < n2) ? src[bi+1] : 0;
+                hw = (lo >> pb) | (hi << (64 - pb));
+            }
+            if (k >= n) { fc += hw; break; }
+            unsigned __int128 s128 = (unsigned __int128)d_x[k] + hw + fc;
+            d_x[k] = (uint64_t)s128;
+            fc = (uint64_t)(s128 >> 64);
+        }
+
+        /* Normalize residual overflow */
+        for (;;) {
+            uint64_t over = (pb > 0) ? (d_x[n-1] >> pb) : 0;
+            if (over) d_x[n-1] &= (1ULL << pb) - 1ULL;
+            uint64_t c2 = fc + over;
+            fc = 0;
+            if (!c2) break;
+            for (int k = 0; k < n && c2; k++) {
+                unsigned __int128 a = (unsigned __int128)d_x[k] + c2;
+                d_x[k] = (uint64_t)a;
+                c2 = (uint64_t)(a >> 64);
+            }
+            fc = c2;
+        }
+
+        /* Canonical M_p → 0 */
+        int is_mp = 1;
+        for (int k = 0; k < n && is_mp; k++) {
+            uint64_t expected;
+            if      (pb == 0) expected = ~0ULL;
+            else if (k < pw)  expected = ~0ULL;
+            else if (k == pw) expected = (1ULL << pb) - 1ULL;
+            else              expected = 0ULL;
+            if (d_x[k] != expected) is_mp = 0;
+        }
+        if (is_mp) for (int k = 0; k < n; k++) d_x[k] = 0;
+
+        /* Subtract 2 mod M_p */
+        int small = 1;
+        for (int k = n-1; k >= 1 && small; k--)
+            if (d_x[k]) small = 0;
+        if (small && d_x[0] >= 2) small = 0;
+
+        if (!small) {
+            uint64_t borrow = 2;
+            for (int k = 0; k < n && borrow; k++) {
+                if (d_x[k] >= borrow) { d_x[k] -= borrow; borrow = 0; }
+                else                  { d_x[k] -= borrow; borrow = 1; }
+            }
+        } else {
+            uint64_t val = d_x[0];
+            for (int k = 0; k < n; k++) d_x[k] = ~0ULL;
+            if (pb > 0) d_x[n-1] = (1ULL << pb) - 1ULL;
+            uint64_t borrow = 2 - val;
+            for (int k = 0; k < n && borrow; k++) {
+                if (d_x[k] >= borrow) { d_x[k] -= borrow; borrow = 0; }
+                else                  { d_x[k] -= borrow; borrow = 1; }
+            }
+        }
+    }  /* end thread 0 */
+}
+
 /* ── ll_gpu: p > CPU_TH — async stream pipeline ──────────────────────────
  *
  * HDGL wu-wei streaming: GPU squaring (parallel) + CPU fold (sequential).
@@ -1844,6 +2101,139 @@ static int ll_gpu(uint64_t p, int verbose) {
     return result;
 }
 
+/* ── ll_gpu_gpucarry: schoolbook squaring + on-device parallel carry scan ─
+ *
+ * Same k_sqr_warp + k_assemble squaring as ll_gpu, but replaces the
+ * PCIe D2H/H2D round-trip with an all-on-device carry pipeline:
+ *
+ *   k_sqr_warp   → d_lo, d_mi, d_hi
+ *   k_assemble   → d_flat[0..n2-1], d_ovf[0..n2-1]
+ *   k_carry_lscan→ d_lpfx[0..n2-1], d_bagg[0..nblks-1]  (block prefix fns)
+ *   k_carry_bscan→ d_bcarry[0..nblks-1], d_topcarry[0]   (<<<1,1>>>)
+ *   k_carry_apply→ d_flat updated in-place (low 64 bits of orig+carry_in)
+ *   k_fold_sub2_gpu → d_x updated in-place                (<<<1,1>>>)
+ *
+ * All six launches captured in a CUDA graph → single cudaGraphLaunch per
+ * iteration, ~1 µs overhead vs ~150 µs PCIe round-trip on Windows/WDDM.
+ * No cudaMemcpy inside the iteration loop.
+ * ──────────────────────────────────────────────────────────────────────── */
+static int ll_gpu_gpucarry(uint64_t p, int verbose) {
+    size_t n  = (size_t)((p + 63) / 64);
+    size_t n2 = 2 * n;
+    int pw = (int)(p / 64);
+    int pb = (int)(p % 64);
+
+    int nblks     = (int)((n2 + CARRY_BLK - 1) / CARRY_BLK);
+    int warp_blks = (int)((n2 + WARP_PER_BLOCK - 1) / WARP_PER_BLOCK);
+    int warp_thr  = WARP_PER_BLOCK * WARP_SIZE;
+    int fld_blks  = (int)((n2 + FOLD_THR    - 1) / FOLD_THR);
+    int cblks     = (int)((n2 + CARRY_BLK   - 1) / CARRY_BLK);
+
+    /* Device buffers */
+    uint64_t *d_x = NULL, *d_lo = NULL, *d_mi = NULL, *d_hi = NULL;
+    uint64_t *d_flat = NULL;
+    uint8_t  *d_ovf  = NULL;
+    uint8_t  *d_lpfx = NULL, *d_bagg = NULL;
+    uint8_t  *d_bcarry = NULL, *d_topcarry = NULL;
+
+    cudaMalloc(&d_x,       n  * sizeof(uint64_t));
+    cudaMalloc(&d_lo,      n2 * sizeof(uint64_t));
+    cudaMalloc(&d_mi,      n2 * sizeof(uint64_t));
+    cudaMalloc(&d_hi,      n2 * sizeof(uint64_t));
+    cudaMalloc(&d_flat,    n2 * sizeof(uint64_t));
+    cudaMalloc(&d_ovf,     n2 * sizeof(uint8_t));
+    cudaMalloc(&d_lpfx,    n2 * sizeof(uint8_t));
+    cudaMalloc(&d_bagg,    (size_t)nblks * sizeof(uint8_t));
+    cudaMalloc(&d_bcarry,  (size_t)nblks * sizeof(uint8_t));
+    cudaMalloc(&d_topcarry, 1  * sizeof(uint8_t));
+
+    /* Set initial LL state: x = 4 */
+    cudaMemset(d_x, 0, n * sizeof(uint64_t));
+    {
+        uint64_t four = 4;
+        cudaMemcpy(d_x, &four, sizeof(uint64_t), cudaMemcpyHostToDevice);
+    }
+
+    /* Configure k_fold_sub2_gpu for dynamic shmem: n2 uint64_t per block.
+     * sm_75 supports up to 96 KB (98304 B) per block.  For p that exceeds
+     * this limit (p > ~393K), fall back to a single-thread global-memory
+     * fold (slower, but correct — same kernel, blockDim.x==1 branch).    */
+    size_t fold_smem = n2 * sizeof(uint64_t);
+    int    fold_thr  = CARRY_BLK;   /* cooperative shmem: 256 threads */
+    if (fold_smem > 98304u) { fold_smem = 0; fold_thr = 1; }  /* fallback */
+    else cudaFuncSetAttribute(k_fold_sub2_gpu,
+                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              (int)fold_smem);
+
+    /* Capture the 6-kernel pipeline into a CUDA graph */
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    cudaGraph_t     graph = NULL;
+    cudaGraphExec_t gexec = NULL;
+
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+    k_sqr_warp<<<warp_blks, warp_thr, 0, stream>>>(
+        d_x, d_lo, d_mi, d_hi, (int)n);
+    k_assemble<<<fld_blks, FOLD_THR, 0, stream>>>(
+        d_lo, d_mi, d_hi, d_flat, d_ovf, (int)n2);
+    k_carry_lscan<<<cblks, CARRY_BLK, 0, stream>>>(
+        d_flat, d_ovf, d_lpfx, d_bagg, (int)n2);
+    k_carry_bscan<<<1, 1, 0, stream>>>(
+        d_bagg, d_bcarry, d_topcarry, nblks);
+    k_carry_apply<<<cblks, CARRY_BLK, 0, stream>>>(
+        d_flat, d_lpfx, d_bcarry, (int)n2);
+    k_fold_sub2_gpu<<<1, fold_thr, fold_smem, stream>>>(
+        d_flat, d_topcarry, d_x, (int)n, (int)p);
+
+    cudaStreamEndCapture(stream, &graph);
+    cudaGraphInstantiate(&gexec, graph, NULL, NULL, 0);
+    cudaGraphDestroy(graph);
+
+    uint64_t iters = p - 2;
+    time_t t_start = time(NULL);
+    time_t t_last  = t_start;
+
+    for (uint64_t i = 0; i < iters; i++) {
+        {
+            time_t t_now = time(NULL);
+            if (t_now - t_last >= PROGRESS_INTERVAL) {
+                double pct = 100.0 * (double)(i + 1) / (double)iters;
+                long elapsed = (long)(t_now - t_start);
+                long eta = (elapsed > 0) ? (long)((double)elapsed * (iters - i - 1) / (double)(i + 1)) : -1;
+                fprintf(stderr, "  [M_%llu gpucarry] iter %llu/%llu  %.1f%%  elapsed %lds  eta %lds\n",
+                        (unsigned long long)p, (unsigned long long)(i + 1),
+                        (unsigned long long)iters, pct, elapsed, eta);
+                t_last = t_now;
+            }
+        }
+        cudaGraphLaunch(gexec, stream);
+    }
+    cudaStreamSynchronize(stream);
+
+    /* Read result: prime iff d_x == 0 */
+    uint64_t *h_x = (uint64_t *)calloc(n, sizeof(uint64_t));
+    cudaMemcpy(h_x, d_x, n * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    int result = 1;
+    for (size_t k = 0; k < n; k++)
+        if (h_x[k]) { result = 0; break; }
+    free(h_x);
+
+    if (verbose)
+        printf("  GPU gpucarry  n_words=%zu  iters=%llu"
+               "  (warp-sqr + parallel carry scan + on-device fold, CUDA graph)\n",
+               n, (unsigned long long)iters);
+
+    cudaGraphExecDestroy(gexec);
+    cudaStreamDestroy(stream);
+    cudaFree(d_x);    cudaFree(d_lo);   cudaFree(d_mi);  cudaFree(d_hi);
+    cudaFree(d_flat); cudaFree(d_ovf);
+    cudaFree(d_lpfx); cudaFree(d_bagg);
+    cudaFree(d_bcarry); cudaFree(d_topcarry);
+    return result;
+}
+
 /* ── ll_gpu_persistent: single kernel launch, all iterations on-device ─── */
 static int ll_gpu_persistent(uint64_t p, int verbose) {
     int n     = (int)((p + 63) / 64);
@@ -1915,9 +2305,11 @@ static int ll_test(uint64_t p, int verbose) {
     if      (p <= 62)      result = ll_small(p, verbose);
     else if (p <= CPU_TH)  result = ll_cpu(p, verbose);
     else if (use_ntt)                                 result = ll_gpu_ntt(p, verbose);
+    else if (g_squaring == 2)                         result = ll_gpu_gpucarry(p, verbose);
+    else if (g_squaring == 0)                         result = ll_gpu(p, verbose);
     else if (g_use_analog_gpu || g_precision == 32)  result = ll_gpu_analog(p, verbose);
     else if (g_use_persistent)   result = ll_gpu_persistent(p, verbose);
-    else                         result = ll_gpu(p, verbose);
+    else                         result = ll_gpu_gpucarry(p, verbose);  /* auto default */
 
     if (verbose)
         printf("  => %s\n\n", result ? "PRIME" : "COMPOSITE");
@@ -2011,8 +2403,9 @@ int main(int argc, char **argv) {
                 if      (strcmp(sv, "ntt")        == 0) g_squaring = 1;
                 else if (strcmp(sv, "schoolbook") == 0) g_squaring = 0;
                 else if (strcmp(sv, "auto")       == 0) g_squaring = -1;
-                else { fprintf(stderr, "--squaring must be 'auto', 'schoolbook', or 'ntt'\n"); return 1; }
-            } else { fprintf(stderr, "--squaring requires a value (auto|schoolbook|ntt)\n"); return 1; }
+                else if (strcmp(sv, "gpucarry")   == 0) g_squaring = 2;
+                else { fprintf(stderr, "--squaring must be 'auto', 'schoolbook', 'ntt', or 'gpucarry'\n"); return 1; }
+            } else { fprintf(stderr, "--squaring requires a value (auto|schoolbook|ntt|gpucarry)\n"); return 1; }
         }
         else p_arg = (uint64_t)strtoull(argv[i], NULL, 10);
     }
