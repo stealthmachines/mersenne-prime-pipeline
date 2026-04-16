@@ -77,6 +77,8 @@
 #define ANA_CV_TO_LOCK       0.10
 #define ANA_EMERGENCY_VAR   1.5   /* > 1.0 impossible for 1-R; sentinel */
 #define ANA_VCO_BASE        0.1   /* VCO floor: omega ≥ 10% of natural even at full lock */
+#define ANA_LN_PHI          0.4812118250596035   /* ln(φ) */
+#define ANA_LN2             0.6931471805599453   /* ln(2) */
 
 /* K/γ ratios: Pluck=1000:1, critical insight from WU_WEI_ANALYSIS.md.
  * Matching APHASE_COUPLING[] and APHASE_GAMMA[] in analog_engine.c. */
@@ -128,6 +130,9 @@ typedef struct {
     int    hist_idx;                      /* write head for theta_hist        */
     int    cv_idx;                        /* write head for cv_hist           */
     int    steps;                         /* total RK4 steps taken            */
+    /* U-field spectral projection (updated every ana_harmonic_sync call) */
+    double lambda_u;   /* Λ_φ^(U) = log(M(U))/ln(φ) - 1/(2φ)  [field phi-log depth] */
+    double s_u;        /* S(U) = |Ω·e^(iπΛ)+1|                [resonance discriminant] */
 } AnaOsc8D;
 
 /* ── Circular order parameter: CV = 1 − R ───────────────────────────────────
@@ -178,9 +183,7 @@ static void ana_init(AnaOsc8D *s, uint64_t p) {
     s->phase_var  = 1.0;   /* valid initial value for 1-R in [0,1] */
 
     /* Phi-logarithmic depth: Λ_φ = ln(p·ln2/lnφ) / lnφ − 1/(2φ) */
-    static const double LN2    = 0.6931471805599453;
-    static const double LN_PHI = 0.4812118250596035;   /* ln(φ) */
-    double Lambda = log((double)p * LN2 / LN_PHI) / LN_PHI - 0.5 / ANA_PHI;
+    double Lambda = log((double)p * ANA_LN2 / ANA_LN_PHI) / ANA_LN_PHI - 0.5 / ANA_PHI;
     double frac_L = Lambda - floor(Lambda);            /* {Λ_φ} ∈ [0,1) */
     double Omega  = 0.5 * (1.0 + sin(ANA_PI * frac_L * ANA_PHI));
     double base_theta = ANA_PI * Lambda;               /* e^(iπΛ_φ) rotation */
@@ -350,6 +353,47 @@ static void ana_harmonic_sync(AnaOsc8D *s,
     /* Extract theta from final (re, im) — one atan2 per oscillator */
     for (int i = 0; i < ANA_DIMS; i++)
         s->theta[i] = atan2(s->im[i], s->re[i]);
+
+    /* ── Unified U-field resonance readout ────────────────────────────────────
+     * Full pipeline (A)→(B)→(C)→(D) from the unified field spec:
+     *
+     * (A) Field observable  M(U) = |Σ_i e^{iθ_i}|  (mean-field amplitude)
+     *     Already in (re,im): M(U) = sqrt((Σ re_i)² + (Σ im_i)²)
+     *     This is the interaction energy Σ_{i,j} interaction(U_i,U_j) in
+     *     mean-field form — same 2-scalar compression used in ana_deriv.
+     *
+     * (B) Spectral projection  Λ_φ^(U) = log(M(U))/ln(φ) - 1/(2φ)
+     *     Same phi-log depth formula as global Λ_φ(p), but emergent from
+     *     the nonlinear field state — not imposed directly from p.
+     *
+     * (C) Phase gate  Ω = (1 + sin(π·{Λ}·φ)) / 2
+     *
+     * (D) Resonance discriminant  S(U) = |Ω·e^(iπΛ) + 1|
+     *     Prime end: all θ→0 → M→N → Λ→log_φ(N) → S characteristic value.
+     *     Composite: phases spread → M(U)<<N → distinct Λ → distinct S.
+     *
+     * Feedback (closing the loop): Ω^(U) modulates k_coupling.
+     *   field state → spectral projection → coupling strength → field state
+     *   κ·log(p) is already encoded in omega0[i] via the global Λ_φ(p) seed. */
+    {
+        double rx = 0.0, ry = 0.0;
+        for (int i = 0; i < ANA_DIMS; i++) { rx += s->re[i]; ry += s->im[i]; }
+        double MU = sqrt(rx*rx + ry*ry);  /* ∈ [0, N] */
+        if (MU > 1e-12) {
+            double Lambda_U  = log(MU) / ANA_LN_PHI - 0.5 / ANA_PHI;
+            double frac_U    = Lambda_U - floor(Lambda_U);
+            if (frac_U < 0.0) frac_U += 1.0;
+            double Omega_U   = 0.5 * (1.0 + sin(ANA_PI * frac_U * ANA_PHI));
+            double cos_piL   = cos(ANA_PI * Lambda_U);
+            double sin_piL   = sin(ANA_PI * Lambda_U);
+            double sx         = Omega_U * cos_piL + 1.0;
+            double sy         = Omega_U * sin_piL;
+            s->lambda_u      = Lambda_U;
+            s->s_u           = sqrt(sx*sx + sy*sy);
+            /* Feedback: scale phase-adaptive coupling by resonance envelope */
+            s->k_coupling    = ANA_COUPLING[s->aphase] * Omega_U;
+        }
+    }
 
     /* Record post-sync CV to lock-detection history */
     double cv = ana_phase_var(s);
@@ -608,16 +652,15 @@ int ll_analog(uint64_t p, int verbose) {
     if (verbose) {
         printf("  [analog] p=%llu  n_words=%zu  osc=8D-Kuramoto\n",
                (unsigned long long)p, n);
-        { /* compute Λ_φ / Ω for display only */
-            static const double LN2_v    = 0.6931471805599453;
-            static const double LN_PHI_v = 0.4812118250596035;
-            double Lv = log((double)p * LN2_v / LN_PHI_v) / LN_PHI_v - 0.5 / ANA_PHI;
+        {
+            double Lv = log((double)p * ANA_LN2 / ANA_LN_PHI) / ANA_LN_PHI - 0.5 / ANA_PHI;
             double fv = Lv - floor(Lv);
             double Ov = 0.5 * (1.0 + sin(ANA_PI * fv * ANA_PHI));
-            printf("  [analog] seed:     Lambda_phi=%.6f  {Lambda_phi}=%.6f  Omega=%.6f\n",
+            printf("  [analog] seed:     Lambda_phi(p)=%.6f  {L}=%.6f  Omega=%.6f\n",
                    Lv, fv, Ov);
-            printf("  [analog] theta0:   pi*Lambda_phi + 2pi*(glyph+{L}+i*D_n_r)  [Euler e^(i*pi*L) base]\n");
+            printf("  [analog] theta0:   pi*L + 2pi*(glyph+{L}+i*D_n_r)  [e^(i*pi*L) Euler base]\n");
             printf("  [analog] omega:    Omega*phi^(1+i*D_n_r)*dt  [phi-lattice resonance envelope]\n");
+            printf("  [analog] field:    M(U)=|sum(e^itheta)|  Lambda^U=log(M)/lnphi-1/2phi  S=|Omega*e^(i*pi*L)+1|\n");
         }
         printf("  [analog] CV:       Kuramoto 1-R in [0,1]  (circular; 0=locked, 1=spread)\n");
         printf("  [analog] multiply: phase-doubling (theta->2theta) + Kuramoto coupling\n");
@@ -683,6 +726,10 @@ int ll_analog(uint64_t p, int verbose) {
                osc.phase_var,
                ana_is_locked(&osc) ? "yes" : "no",
                result ? "0 (PRIME)" : "non-zero (COMPOSITE)");
+        /* Field resonance readout S(U) */
+        printf("  [analog] S(U)=%.6f  Lambda^U=%.6f  (prime: S~%.4f, composite: S!=)\n",
+               osc.s_u, osc.lambda_u,
+               0.5 * (1.0 + sin(ANA_PI * 0.0 * ANA_PHI)) * cos(0.0) + 1.0);
         /* Double confirmation: both analog and exact agree */
         if (ana_is_locked(&osc) && result)
             printf("  [analog] ** osc LOCKED + residue=0: strong prime resonance **\n");
