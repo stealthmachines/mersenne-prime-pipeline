@@ -147,18 +147,29 @@ static double ana_phase_var(const AnaOsc8D *s) {
     return 1.0 - R;   /* 0 = locked, 1 = maximally spread */
 }
 
-/* ── Oscillator initialisation — HDGL glyph chain reaction ──────────────────
- * Replaces det_rand64 + BASE_INF_SEEDS (digital thinking) with the HDGL glyph.
+/* ── Oscillator initialisation — Λ_φ phi-logarithmic seeding ─────────────────
  *
- * theta[i]: φ-strided projection of glyph + p-modulation + i×D_n_r offset.
- *   gi = floor(i×φ×7) mod 20  samples across all glyph rows.
- *   Raw value = glyph[gi] + D_n_r×p mod 1 + i×D_n_r  (then ×2π).
- *   The i×D_n_r term is the recursive offset — the chain reaction step that
- *   separates same-value components (e.g. X=Z=0.618 at i=0,2).
+ * Generalized Euler identity (the analog primality signal):
+ *   Ω(Λ_φ) · C²(Λ_φ) · e^(iπΛ_φ) + 1 + δ(Λ_φ) = 0
  *
- * omega[i]: chain reaction along the harmonic (φ) axis:
- *   ω[i] = φ^(1 + i×D_n_r) × dt    ← Glyph_next = D_n_r ⊗ Glyph
- *   Irrationally spaced, naturally increasing; purely analog origin. */
+ * Λ_φ is the phi-logarithmic depth of M_p = 2^p − 1:
+ *   Λ_φ = log_φ(p·ln2 / lnφ) − 1/(2φ)
+ *       = ln(p·ln2/lnφ) / lnφ − 1/(2φ)
+ *   Encodes: how many φ-scalings deep the p-bit exponent sits in the φ-lattice.
+ *   {Λ_φ} ∈ [0,1): fractional part — unique per p, irrational spread, no aliasing.
+ *
+ * Ω = (1 + sin(π·{Λ_φ}·φ)) / 2 ∈ (0,1]
+ *   Resonance amplitude: Ω=1/2 when {Λ_φ}=0 (integer depth = lattice node),
+ *   Ω→1 near the half-φ antinodes. Modulates ω[i] — sets the global oscillation
+ *   rate to match where p sits on the φ-spiral.
+ *
+ * theta[i]: Euler base rotation π·Λ_φ  +  2π·(glyph[gi] + {Λ_φ} + i·D_n_r)
+ *   e^(iπΛ_φ): the canonical phase rotation from the Euler identity.
+ *   {Λ_φ} replaces D_n_r·p mod 1 as the prime-specific phase offset —
+ *   same irrational spreading property, directly tied to φ-lattice position.
+ *
+ * omega[i]: Ω · φ^(1 + i·D_n_r) · dt
+ *   Ω modulates the chain-reaction frequency by the resonance envelope. */
 static void ana_init(AnaOsc8D *s, uint64_t p) {
     memset(s, 0, sizeof(*s));
     s->aphase     = APHASE_PLUCK;
@@ -166,16 +177,23 @@ static void ana_init(AnaOsc8D *s, uint64_t p) {
     s->k_coupling = ANA_COUPLING[APHASE_PLUCK];
     s->phase_var  = 1.0;   /* valid initial value for 1-R in [0,1] */
 
-    double p_phase = fmod((double)p * HDGL_GLYPH[18], 1.0);  /* D_n_r × p mod 1 */
+    /* Phi-logarithmic depth: Λ_φ = ln(p·ln2/lnφ) / lnφ − 1/(2φ) */
+    static const double LN2    = 0.6931471805599453;
+    static const double LN_PHI = 0.4812118250596035;   /* ln(φ) */
+    double Lambda = log((double)p * LN2 / LN_PHI) / LN_PHI - 0.5 / ANA_PHI;
+    double frac_L = Lambda - floor(Lambda);            /* {Λ_φ} ∈ [0,1) */
+    double Omega  = 0.5 * (1.0 + sin(ANA_PI * frac_L * ANA_PHI));
+    double base_theta = ANA_PI * Lambda;               /* e^(iπΛ_φ) rotation */
+
     for (int i = 0; i < ANA_DIMS; i++) {
         /* Glyph indices for i=0..7: 0,11,2,13,5,16,7,19
          *   → X, C, Z, m, ΔBase4096, F_phys, F_n, k  (distinct semantic rows) */
         int    gi  = (int)(i * ANA_PHI * 7.0) % 20;
-        double raw = fmod(HDGL_GLYPH[gi] + p_phase + i * HDGL_GLYPH[18], 1.0);
-        s->theta[i] = 2.0 * ANA_PI * raw;
+        double raw = fmod(HDGL_GLYPH[gi] + frac_L + i * HDGL_GLYPH[18], 1.0);
+        s->theta[i] = fmod(base_theta + 2.0 * ANA_PI * raw, 2.0 * ANA_PI);
         s->re[i]    = cos(s->theta[i]);
         s->im[i]    = sin(s->theta[i]);
-        s->omega[i]  = pow(ANA_PHI, 1.0 + i * HDGL_GLYPH[18]) * ANA_DT;
+        s->omega[i]  = Omega * pow(ANA_PHI, 1.0 + i * HDGL_GLYPH[18]) * ANA_DT;
         s->omega0[i] = s->omega[i];   /* VCO base — CV will modulate around this */
     }
 }
@@ -590,8 +608,17 @@ int ll_analog(uint64_t p, int verbose) {
     if (verbose) {
         printf("  [analog] p=%llu  n_words=%zu  osc=8D-Kuramoto\n",
                (unsigned long long)p, n);
-        printf("  [analog] seed:     HDGL glyph (20 components), p_phase=D_n_r*p mod 1\n");
-        printf("  [analog] omega:    phi^(1+i*D_n_r)*dt  [chain reaction, harmonic axis]\n");
+        { /* compute Λ_φ / Ω for display only */
+            static const double LN2_v    = 0.6931471805599453;
+            static const double LN_PHI_v = 0.4812118250596035;
+            double Lv = log((double)p * LN2_v / LN_PHI_v) / LN_PHI_v - 0.5 / ANA_PHI;
+            double fv = Lv - floor(Lv);
+            double Ov = 0.5 * (1.0 + sin(ANA_PI * fv * ANA_PHI));
+            printf("  [analog] seed:     Lambda_phi=%.6f  {Lambda_phi}=%.6f  Omega=%.6f\n",
+                   Lv, fv, Ov);
+            printf("  [analog] theta0:   pi*Lambda_phi + 2pi*(glyph+{L}+i*D_n_r)  [Euler e^(i*pi*L) base]\n");
+            printf("  [analog] omega:    Omega*phi^(1+i*D_n_r)*dt  [phi-lattice resonance envelope]\n");
+        }
         printf("  [analog] CV:       Kuramoto 1-R in [0,1]  (circular; 0=locked, 1=spread)\n");
         printf("  [analog] multiply: phase-doubling (theta->2theta) + Kuramoto coupling\n");
         printf("  [analog] sync:     harmonic attraction alpha=%.1fx%d (atan2, first Fourier modes)\n",
