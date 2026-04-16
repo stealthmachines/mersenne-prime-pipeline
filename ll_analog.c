@@ -389,28 +389,55 @@ static void fold_mod_mp_a(const uint64_t *prod, size_t prod_len,
 
 /* ap_sqr_mersenne: in-place s[] = s[]² mod 2^p-1.
  * tmp must point to a caller-provided zeroed buffer of (2n+2) uint64_t.
- * Identical schoolbook pattern to mpi_sqr_mod_mp_cpu in ll_mpi.cu. */
+ *
+ * Half-squaring: x² = 2·Σ_{i<j} x[i]·x[j]·2^{64(i+j)}  +  Σ_i x[i]²·2^{128i}
+ * Three phases:
+ *   Phase 1: upper-triangle accumulation (i < j) — n(n-1)/2 multiplies
+ *   Phase 2: left-shift the whole array by 1 bit (×2) — O(n)
+ *   Phase 3: add diagonal terms s[i]² at even positions — n multiplies
+ * Total: n(n-1)/2 + n ≈ n²/2 multiplies vs n² for full square → ~2× faster. */
 static void ap_sqr_mersenne(uint64_t *s, size_t n, uint64_t p, uint64_t *tmp) {
     size_t n2 = 2 * n;
     memset(tmp, 0, (n2 + 2) * sizeof(uint64_t));
 
+    /* ── Phase 1: upper triangle (i < j) ── */
     for (size_t i = 0; i < n; i++) {
-        unsigned __int128 carry = 0;
         uint64_t xi = s[i];
         if (!xi) continue;
-        for (size_t j = 0; j < n; j++) {
+        unsigned __int128 carry = 0;
+        for (size_t j = i + 1; j < n; j++) {
             unsigned __int128 t = (unsigned __int128)xi * s[j]
                                 + tmp[i + j] + carry;
             tmp[i + j] = (uint64_t)t;
             carry       = t >> 64;
         }
-        /* propagate carry beyond the inner loop */
         size_t k = i + n;
         while (carry) {
             unsigned __int128 t = (unsigned __int128)tmp[k] + carry;
             tmp[k] = (uint64_t)t;
             carry   = t >> 64;
             k++;
+        }
+    }
+
+    /* ── Phase 2: double the upper-triangle sum (1-bit left-shift) ── */
+    uint64_t carry_bit = 0;
+    for (size_t k = 0; k < n2 + 2; k++) {
+        uint64_t next = tmp[k] >> 63;
+        tmp[k] = (tmp[k] << 1) | carry_bit;
+        carry_bit = next;
+    }
+
+    /* ── Phase 3: add diagonal s[i]² at position 2i ── */
+    for (size_t i = 0; i < n; i++) {
+        unsigned __int128 diag  = (unsigned __int128)s[i] * s[i];
+        unsigned __int128 carry = (unsigned __int128)tmp[2*i] + (uint64_t)diag;
+        tmp[2*i] = (uint64_t)carry;
+        carry = (carry >> 64) + (diag >> 64);
+        for (size_t k = 2*i + 1; carry; k++) {
+            carry += tmp[k];
+            tmp[k] = (uint64_t)carry;
+            carry >>= 64;
         }
     }
 

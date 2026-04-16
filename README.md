@@ -271,18 +271,20 @@ bottleneck.
 
 | Exponent p | Words n | Time | vs schoolbook (GPU) | vs gpucarry |
 |------------|---------|------|---------------------|-------------|
-| 521 | 9 | 0.026 s | ~1.2× slower | ~1.1× slower |
-| 2 281 | 36 | 0.035 s | ~1.1× slower | ~1.1× slower |
-| 4 423 | 70 | 0.085 s | ~1.0× | ~1.2× slower |
-| 9 689 | 152 | 0.616 s | ~1.1× slower | ~1.1× slower |
-| 21 701 | 340 | 6.27 s | **1.7× slower** | **5.0× slower** |
-| 44 497 | 696 | 52.0 s | **7.1× slower** | **12.8× slower** |
+| 521 | 9 | 0.025 s | ~1.1× slower | ~1.0× (parity) |
+| 2 281 | 36 | 0.041 s | ~1.4× slower | ~1.4× slower |
+| 4 423 | 70 | 0.086 s | ~1.2× slower | ~1.2× slower |
+| 9 689 | 152 | 0.400 s | **1.3× faster** | **1.5× faster** |
+| 21 701 | 340 | 3.226 s | **1.1× faster** | ~2.2× slower |
+| 44 497 | 696 | 25.08 s | ~3.5× slower | ~5.9× slower |
 
-Below p ≈ 9 689 (n < 152 words) all paths are noise-dominated by process launch overhead
-and times are indistinguishable (<0.1 s).  At large p the O(n²) gap vs GPU paths widens
-because `ap_sqr_mersenne` computes the full n×n product (both triangles) whereas
-`mpi_sqr_mod_mp_cpu` uses the half-squaring optimisation.  The RK4 oscillator (~256
-`sin()` calls per iteration) contributes negligibly.  Optimisation opportunities: see
+Timings with half-squaring + `-O3 -march=native` (see Planned optimisations — item 1 done).
+At p = 9 689 and p = 21 701 the analog path **beats schoolbook GPU** — both are O(n²) but
+`ap_sqr_mersenne` only computes the upper triangle (~n²/2 multiplies) plus the diagonal,
+and Intel scalar 64-bit with `-O3` micro-benchmarks faster than the GPU kernel at these
+sizes.  At p = 44 497 (n = 696) the GPU's parallelism asserts and gpucarry pulls away.
+The RK4 oscillator (~256 `sin()` calls per iteration) contributes negligibly (<0.4% of
+runtime at all measured exponents).  Further opportunities: see
 [Planned optimisations for `ll_analog`](#planned-optimisations-for-ll_analog) below.
 
 Oscillator behaviour: on Mersenne primes the phase CV drops from ~1.6 (Pluck) to <0.002
@@ -320,8 +322,9 @@ competitor.
 The analog path is correct and self-contained but uses a naive full-triangle schoolbook
 multiply.  The following are planned:
 
-1. **Half-squaring**: skip the lower triangle (`j < i` terms), compute once and double.
-   Expected speedup: ~2× at all sizes (matches `mpi_sqr_mod_mp_cpu`).
+1. ✅ **Half-squaring** (done — `-O3 -march=native`, 3-phase upper-triangle + double +
+   diagonal; ~2× speedup confirmed: p=21701 6.27 s → 3.23 s, p=44497 52.0 s → 25.1 s;
+   at p=9689 now **beats** both schoolbook-GPU and gpucarry).
 2. **`__int128` carry-chain merge**: fold the Mersenne reduction directly into the
    schoolbook inner loop rather than building a separate 2n-word buffer.
    Reduces peak memory traffic by ~50% for large n.

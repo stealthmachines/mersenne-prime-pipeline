@@ -19,9 +19,10 @@ echo [ll_mpi] Building Lucas-Lehmer MPI (schoolbook, sm_75)...
 echo   Source : %SRC%
 echo   Output : %OUT%
 
-echo [ll_mpi] Compiling ll_analog.c (pure C, no CUDA)...
+echo [ll_mpi] Compiling ll_analog.c (pure C, O3+native)...
 clang ^
-  -O2 ^
+  -O3 ^
+  -march=native ^
   -D_CRT_SECURE_NO_WARNINGS ^
   -Wall ^
   -c "%ANALOG_C%" ^
