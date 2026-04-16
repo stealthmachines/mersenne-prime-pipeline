@@ -132,16 +132,18 @@ CPU sub-2 mod M_p → h_x
 | `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
 
-### Benchmarks (RTX 2060, sm_75, April 2026)
+### Benchmarks (RTX 2060, sm_75, April 2026, `feature/ntt-full`)
+
+75/75 selftest pass across all three paths (default, `--squaring ntt`, `--precision 32`).
 
 **Default stream path (`ll_gpu` — `k_sqr_warp` + CPU fold):**
 
-| Exponent p | Words n | Iterations | Time | vs limb baseline |
-|------------|---------|-----------|------|------------------|
-| 21 701 | 340 | 21 699 | **3.7 s** | — |
-| 44 497 | 696 | 44 495 | **7.0 s** | — |
-| 86 243 | 1 348 | 86 241 | **14.7 s** | — |
-| 110 503 | 1 727 | 110 501 | **22.4 s** | — |
+| Exponent p | Words n | Iterations | Time |
+|------------|---------|-----------|------|
+| 21 701 | 340 | 21 699 | **3.6 s** |
+| 44 497 | 696 | 44 495 | **7.3 s** |
+| 86 243 | 1 348 | 86 241 | **14.9 s** |
+| 110 503 | 1 727 | 110 501 | **22.1 s** |
 
 Speedup grows with p because larger n means longer warp inner loops — the 32-lane
 warp reduction provides a larger multiplier on the serial inner-product bottleneck.
@@ -157,14 +159,14 @@ warp reduction provides a larger multiplier on the serial inner-product bottlene
 | 86 243 | 1 348 | 8 192 | 79.0 s | 5.4× slower |
 | 110 503 | 1 727 | 8 192 | 105.1 s | 4.7× slower |
 
-*Optimised (`feature/ntt-optimized` — precomputed twiddles + CUDA graph replay + dual-stream DMA + CPU carry-collect):*
+*Optimised (precomputed twiddles + CUDA graph replay + dual-stream DMA + CPU carry-collect):*
 
 | Exponent p | Words n | NTT length L | Time | vs schoolbook | speedup vs unopt |
-|------------|---------|-------------|------|---------------|-----------------|
-| 21 701 | 340 | 2 048 | **5.1 s** | 1.38× slower | 3.0× |
-| 44 497 | 696 | 4 096 | **10.6 s** | 1.51× slower | 3.4× |
-| 86 243 | 1 348 | 8 192 | **24.1 s** | 1.64× slower | 3.3× |
-| 110 503 | 1 727 | 8 192 | **31.5 s** | 1.41× slower | 3.3× |
+|------------|---------|-------------|------|---------------|------------------|
+| 21 701 | 340 | 2 048 | **5.2 s** | 1.44× slower | 3.0× |
+| 44 497 | 696 | 4 096 | **10.9 s** | 1.49× slower | 3.3× |
+| 86 243 | 1 348 | 8 192 | **22.9 s** | 1.54× slower | 3.5× |
+| 110 503 | 1 727 | 8 192 | **32.0 s** | 1.45× slower | 3.3× |
 
 Three optimisations applied on this branch:
 
@@ -190,11 +192,20 @@ The remaining gap to schoolbook (~1.4×) is the PCIe round-trip (H2D after every
 which is also present in the schoolbook path.  At larger p the NTT's O(n log n) complexity
 advantage overtakes the constant overhead.
 
+**32-bit decomposition path (`--precision 32` — `k_sqr_warp32` + CPU fold):**
+
+| Exponent p | Words n | Time | vs default (64-bit) |
+|------------|---------|------|---------------------|
+| 21 701 | 340 | **4.2 s** | 1.17× slower |
+| 44 497 | 696 | **7.8 s** | 1.07× slower |
+| 86 243 | 1 348 | **18.0 s** | 1.21× slower |
+| 110 503 | 1 727 | **24.9 s** | 1.13× slower |
+
 **Persistent path (`--persistent` — single kernel launch):**
 
 | Exponent p | Words n | Time | vs default stream |
 |------------|---------|------|-------------------|
-| 110 503 | 1 727 | **144.6 s** | 6.8× slower |
+| 110 503 | 1 727 | **144.6 s** | 6.5× slower |
 
 The persistent kernel runs all p−2 iterations in one block of 1 024 threads with no
 host round-trips.  At n=1 727 the per-iteration computation dominates; the multi-block
@@ -217,10 +228,10 @@ engines sit at different points on two independent axes:
 
 Using `--squaring ntt` isolates the algorithmic axis: it matches GpuOwl's complexity
 class while remaining **exact-integer arithmetic** (mod the Solinas prime Q = 2^64−2^32+1),
-not floating-point.  In the optimised form (`feature/ntt-optimized`) the remaining gap to
-schoolbook is ~1.4× constant factor from the PCIe D2H/H2D round-trip (both paths pay this
-cost), not a fundamental algorithmic deficit.  At larger p the O(n log n) advantage
-overtakes the O(n²) schoolbook, making the NTT path the clear winner.
+not floating-point.  In the optimised form the remaining gap to schoolbook is ~1.5×
+constant factor from the PCIe D2H/H2D round-trip (both paths pay this cost), not a
+fundamental algorithmic deficit.  At larger p the O(n log n) advantage overtakes the
+O(n²) schoolbook, making the NTT path the clear winner.
 
 The engine is intentionally a **provably-exact reference verifier**, not a speed
 competitor.
