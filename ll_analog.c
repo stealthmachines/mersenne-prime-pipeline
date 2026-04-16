@@ -76,6 +76,7 @@
 #define ANA_CV_TO_FINETUNE   0.30
 #define ANA_CV_TO_LOCK       0.10
 #define ANA_EMERGENCY_VAR   1.5   /* > 1.0 impossible for 1-R; sentinel */
+#define ANA_VCO_BASE        0.1   /* VCO floor: omega ≥ 10% of natural even at full lock */
 
 /* K/γ ratios: Pluck=1000:1, critical insight from WU_WEI_ANALYSIS.md.
  * Matching APHASE_COUPLING[] and APHASE_GAMMA[] in analog_engine.c. */
@@ -116,7 +117,8 @@ typedef struct {
     double re[ANA_DIMS];                  /* complex amplitude — real part    */
     double im[ANA_DIMS];                  /* complex amplitude — imag part    */
     double theta[ANA_DIMS];               /* oscillator phases [0, 2π)        */
-    double omega[ANA_DIMS];               /* natural frequencies (rad/step)   */
+    double omega[ANA_DIMS];               /* VCO-modulated frequencies        */
+    double omega0[ANA_DIMS];              /* base glyph frequencies (const)   */
     double gamma;                         /* current damping coefficient      */
     double k_coupling;                    /* current coupling strength        */
     APhase aphase;                        /* adaptive phase state             */
@@ -173,7 +175,8 @@ static void ana_init(AnaOsc8D *s, uint64_t p) {
         s->theta[i] = 2.0 * ANA_PI * raw;
         s->re[i]    = cos(s->theta[i]);
         s->im[i]    = sin(s->theta[i]);
-        s->omega[i] = pow(ANA_PHI, 1.0 + i * HDGL_GLYPH[18]) * ANA_DT;
+        s->omega[i]  = pow(ANA_PHI, 1.0 + i * HDGL_GLYPH[18]) * ANA_DT;
+        s->omega0[i] = s->omega[i];   /* VCO base — CV will modulate around this */
     }
 }
 
@@ -335,6 +338,13 @@ static void ana_update_phase(AnaOsc8D *s) {
         s->gamma      = ANA_GAMMA[new_phase];
         s->k_coupling = ANA_COUPLING[new_phase];
     }
+
+    /* VCO: CV (= phase_var = 1−R) directly drives ω — closes analog feedback loop.
+     * High CV → ω near omega0  (exploration, oscillators scan phase space).
+     * Low CV  → ω near 10%×omega0 (stable lock, minimal drift).
+     * Mirrors hardware VCO: control voltage → frequency, no digital logic. */
+    for (int i = 0; i < ANA_DIMS; i++)
+        s->omega[i] = s->omega0[i] * (ANA_VCO_BASE + (1.0 - ANA_VCO_BASE) * cv);
 }
 
 /* ── Lock detection: check the most recent post-resync CV ────────────────────
@@ -528,6 +538,8 @@ static int is_zero_a(const uint64_t *words, size_t n) {
  * Final report includes oscillator lock status alongside residue result.
  * ════════════════════════════════════════════════════════════════════════════ */
 int ll_analog(uint64_t p, int verbose) {
+    if (p == 2) return 1;   /* M_2 = 3, known prime; LL loop undefined for p<3 */
+
     size_t n  = (size_t)((p + 63) / 64);   /* Slot4096 mantissa word count */
     size_t n2 = 2 * n;
 
