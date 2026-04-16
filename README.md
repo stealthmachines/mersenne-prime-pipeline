@@ -121,14 +121,14 @@ CPU sub-2 mod M_p → h_x
   d_x ◄──── H2D upload ─── h_x
 ```
 
-### Five Dispatch Paths
+### Five Dispatch Paths (auto-select enabled)
 
 | Path | Range | Flag | Notes |
 |------|-------|------|-------|
 | `ll_small` | p ≤ 62 | — | `unsigned __int128`, direct fold |
 | `ll_cpu` | 62 < p ≤ 20 000 | — | Schoolbook MPI, `__int128` carry |
-| `ll_gpu` | p > 20 000 | (default) | `k_sqr_warp` 64-bit warp shuffle + CPU fold |
-| `ll_gpu_ntt` | p > 20 000 | `--squaring ntt` | `k_ntt_butterfly` + `k_ntt_sqr` — O(n log n) NTT over Z/(2⁶⁴−2³²+1), exact |
+| `ll_gpu` | p > 20 000 | **auto, p < 400 000** | `k_sqr_warp` 64-bit warp shuffle + CPU fold |
+| `ll_gpu_ntt` | p > 20 000 | **auto, p ≥ 400 000** · or `--squaring ntt` | `k_ntt_butterfly` + `k_ntt_sqr` — O(n log n) NTT over Z/(2⁶⁴−2³²+1), exact |
 | `ll_gpu_analog` | p > 20 000 | `--analog` / `--precision 32` | `k_sqr_warp32` 32-bit decomposition variant |
 | `ll_gpu_persistent` | any p > 20 000 | `--persistent` | single kernel launch — all p−2 iterations on-device, no host round-trips |
 
@@ -192,6 +192,24 @@ The remaining gap to schoolbook (~1.4×) is the PCIe round-trip (H2D after every
 which is also present in the schoolbook path.  At larger p the NTT's O(n log n) complexity
 advantage overtakes the constant overhead.
 
+**NTT vs schoolbook crossover (auto-select calibration, RTX 2060, April 2026):**
+
+| Exponent p | NTT length L | Schoolbook | NTT optimised | Winner |
+|------------|-------------|------------|---------------|--------|
+| 132 049 | 8 192 | 27.7 s | 42.3 s | schoolbook |
+| 216 091 | 16 384 | 57.5 s | 79.4 s | schoolbook |
+| 300 000 | 32 768 | 103.1 s | 122.4 s | schoolbook |
+| ≈386 000 | 32 768 | — | — | model crossover |
+
+Model fit (RTX 2060, sm\_75):
+
+$$T_{\text{schoolbook}} \approx 1.915\times10^{-15}\,p^3 + 1.766\times10^{-4}\,p$$
+$$T_{\text{NTT}} \approx 4.193\times10^{-11}\,p^2\log_2 L + 2.193\times10^{-4}\,p$$
+
+Cubic (O(p³)) vs quadratic-times-log (O(p²·log p)) — equating and solving the quadratic for p
+gives a crossover at **p ≈ 386 000**.  The engine uses `NTT_AUTO_THRESHOLD = 400 000` as a
+conservative margin.  Override with `--squaring schoolbook` or `--squaring ntt`.
+
 **32-bit decomposition path (`--precision 32` — `k_sqr_warp32` + CPU fold):**
 
 | Exponent p | Words n | Time | vs default (64-bit) |
@@ -253,8 +271,9 @@ ll_mpi.exe <p> --verbose                # timing + resonance report
 ll_mpi.exe <p> --precision 64           # 64-bit warp squaring via __int128 (default)
 ll_mpi.exe <p> --precision 32           # 32-bit half-multiply decomposition
 ll_mpi.exe <p> --analog                 # legacy alias for --precision 32
-ll_mpi.exe <p> --squaring schoolbook    # O(n²) schoolbook multiply (default)
-ll_mpi.exe <p> --squaring ntt           # O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
+ll_mpi.exe <p> --squaring auto          # auto-select: schoolbook if p < 400000, NTT if p ≥ 400000 (default)
+ll_mpi.exe <p> --squaring schoolbook    # force O(n²) schoolbook multiply
+ll_mpi.exe <p> --squaring ntt           # force O(n log n) NTT squaring over Z/(2⁶⁴-2³²+1)
 ll_mpi.exe <p> --persistent             # single kernel, all iterations on-device
 ll_mpi.exe --gpu-info                   # list CUDA devices
 ```

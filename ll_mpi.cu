@@ -60,6 +60,13 @@
  * Below CPU_TH: schoolbook on MPI->words, single-threaded, exact.
  * Above CPU_TH: GPU-parallel schoolbook kernel k_sqr_limb, exact.         */
 #define CPU_TH   20000u   /* exponent p; n_words = ceil(p/64) <= 313 */
+
+/* Auto-select NTT vs schoolbook threshold.  Empirically determined on RTX 2060
+ * (sm_75, April 2026).  Schoolbook is O(p^3), NTT optimised is O(p^2 log p);
+ * the two models cross at p ≈ 386 000.  We use 400 000 as a conservative
+ * margin.  Override at any time with --squaring schoolbook|ntt.          */
+#define NTT_AUTO_THRESHOLD 400000u
+
 /* Progress report interval in wall-clock seconds.  Checked once per
  * iteration on the host-side CPU round-trip — zero GPU impact.        */
 #define PROGRESS_INTERVAL 30
@@ -83,7 +90,8 @@ static const int PRIMES50[50] = {
 static int g_use_analog_gpu   = 0;   /* legacy alias for --precision 32 */
 static int g_use_persistent   = 0;
 static int g_precision        = 64;  /* squaring limb width: 32 or 64 */
-static int g_squaring         = 0;   /* 0=schoolbook 1=ntt            */
+/* g_squaring: -1=auto (pick fastest based on p), 0=force schoolbook, 1=force ntt */
+static int g_squaring         = -1;
 static void cpu_fold_sub2(uint64_t *h_flat, const uint8_t *h_ovf,
                           uint64_t *h_x, size_t n, size_t n2,
                           int pw, int pb);
@@ -1890,10 +1898,23 @@ static int ll_test(uint64_t p, int verbose) {
         report_resonance(p);
     }
 
+    /* Resolve auto-select: NTT wins above NTT_AUTO_THRESHOLD.             *
+     * Explicit --squaring flag always overrides auto.                     */
+    int use_ntt;
+    if      (g_squaring == 1)  use_ntt = 1;
+    else if (g_squaring == 0)  use_ntt = 0;
+    else                       use_ntt = (p >= NTT_AUTO_THRESHOLD);
+
+    if (verbose && p > CPU_TH && !g_use_analog_gpu && g_precision != 32
+                && !g_use_persistent && g_squaring == -1)
+        printf("  [auto-select] p=%llu %s NTT_AUTO_THRESHOLD=%u -> %s\n",
+               (unsigned long long)p, use_ntt ? ">=" : "<",
+               NTT_AUTO_THRESHOLD, use_ntt ? "NTT" : "schoolbook");
+
     int result;
     if      (p <= 62)      result = ll_small(p, verbose);
     else if (p <= CPU_TH)  result = ll_cpu(p, verbose);
-    else if (g_squaring == 1)                         result = ll_gpu_ntt(p, verbose);
+    else if (use_ntt)                                 result = ll_gpu_ntt(p, verbose);
     else if (g_use_analog_gpu || g_precision == 32)  result = ll_gpu_analog(p, verbose);
     else if (g_use_persistent)   result = ll_gpu_persistent(p, verbose);
     else                         result = ll_gpu(p, verbose);
@@ -1989,8 +2010,9 @@ int main(int argc, char **argv) {
                 const char *sv = argv[++i];
                 if      (strcmp(sv, "ntt")        == 0) g_squaring = 1;
                 else if (strcmp(sv, "schoolbook") == 0) g_squaring = 0;
-                else { fprintf(stderr, "--squaring must be 'schoolbook' or 'ntt'\n"); return 1; }
-            } else { fprintf(stderr, "--squaring requires a value (schoolbook or ntt)\n"); return 1; }
+                else if (strcmp(sv, "auto")       == 0) g_squaring = -1;
+                else { fprintf(stderr, "--squaring must be 'auto', 'schoolbook', or 'ntt'\n"); return 1; }
+            } else { fprintf(stderr, "--squaring requires a value (auto|schoolbook|ntt)\n"); return 1; }
         }
         else p_arg = (uint64_t)strtoull(argv[i], NULL, 10);
     }
