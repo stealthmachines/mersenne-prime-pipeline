@@ -55,10 +55,16 @@ Derived from `hdgl_analog_v30b.c` and `analog_engine.h`.  Two systems run in par
 - **Exact arithmetic side** — arbitrary-precision mantissa (`Slot4096.mantissa_words` layout:
   `uint64_t[n]`, `n = ⌈p/64⌉`).  `ap_sqr_mersenne`: schoolbook O(n²) via `__int128`, Mersenne
   fold identical to `fold_mod_mp` in `ll_mpi.cu`.  Every p−2 iterations run exactly.
-- **8D Kuramoto oscillator** — RK4-integrated, φ-seeded natural frequencies (`φ¹–φ⁸ × dt`).
-  Cooperative memory: every 8 iterations a FNV-1a XOR-fold of the residue words perturbs
-  the oscillator phases — the exact arithmetic trajectory imprints onto the analog state.
-  K/γ wu-wei ratios (from `WU_WEI_ANALYSIS.md`): Pluck=1000:1 → Sustain → FineTune → Lock.
+- **8D Kuramoto oscillator** — four analog-native operators, no digital surrogates:
+  - **Seed** — HDGL 20-component glyph φ-projection + D_n_r chain reaction; each prime p
+    maps to a unique glyph slice (`p_phase = D_n_r × p mod 1`, `ω_i = φ^(1+i·D_n_r) × dt`).
+  - **Multiply** — phase doubling `θ → 2θ mod 2π` (unit-circle analogue of s² in LL).
+  - **Sync** — harmonic attraction `α·atan2(sin(T−θ), cos(T−θ))` × 4 passes (α=0.8);
+    first Fourier mode of phase difference; cooperative residue hash every 8 iters.
+  - **VCO** — Kuramoto order parameter CV = 1−R ∈ [0,1] drives oscillator frequency:
+    `ω_i = ω₀_i × (0.1 + 0.9 × cv)`; high CV → full ω (exploration), low CV → 10% ω
+    (stable lock). Closes the analog feedback loop; mirrors hardware VCO.
+  K/γ wu-wei ratios: Pluck=1000:1 → Sustain → FineTune → Lock (adaptive phase state).
   Phase lock is a readout, not a gate.  `osc LOCKED + residue=0` = strong prime resonance.
 
 Use cases: CUDA-free verification, Kuramoto-coupled scheduling diagnostics, golden
@@ -274,11 +280,11 @@ bottleneck.
 | 521 | 9 | 0.025 s | ~1.1× slower | ~1.0× (parity) |
 | 2 281 | 36 | 0.041 s | ~1.4× slower | ~1.4× slower |
 | 4 423 | 70 | 0.086 s | ~1.2× slower | ~1.2× slower |
-| 9 689 | 152 | 0.400 s | **1.3× faster** | **1.5× faster** |
-| 21 701 | 340 | 3.226 s | **1.1× faster** | ~2.2× slower |
+| 9 689 | 152 | 0.382 s | **1.3× faster** | **1.6× faster** |
+| 21 701 | 340 | 3.137 s | **1.2× faster** | ~2.2× slower |
 | 44 497 | 696 | 25.08 s | ~3.5× slower | ~5.9× slower |
 
-Timings with half-squaring + `-O3 -march=native` (see Planned optimisations — item 1 done).
+Timings with half-squaring + VCO + `-O3 -march=native` (see Planned optimisations — items 1, 2 done).
 At p = 9 689 and p = 21 701 the analog path **beats schoolbook GPU** — both are O(n²) but
 `ap_sqr_mersenne` only computes the upper triangle (~n²/2 multiplies) plus the diagonal,
 and Intel scalar 64-bit with `-O3` micro-benchmarks faster than the GPU kernel at these
@@ -325,18 +331,21 @@ multiply.  The following are planned:
 1. ✅ **Half-squaring** (done — `-O3 -march=native`, 3-phase upper-triangle + double +
    diagonal; ~2× speedup confirmed: p=21701 6.27 s → 3.23 s, p=44497 52.0 s → 25.1 s;
    at p=9689 now **beats** both schoolbook-GPU and gpucarry).
-2. **`__int128` carry-chain merge**: fold the Mersenne reduction directly into the
+2. ✅ **VCO — CV drives ω** (done — Kuramoto 1−R order parameter directly modulates
+   `ω_i = ω₀_i × (VCO_BASE + (1−VCO_BASE) × cv)`; floor=0.1 prevents oscillator freeze
+   at full lock; p=9689 0.400 s → 0.382 s, ~4.5% improvement; closes analog feedback loop).
+3. **`__int128` carry-chain merge**: fold the Mersenne reduction directly into the
    schoolbook inner loop rather than building a separate 2n-word buffer.
    Reduces peak memory traffic by ~50% for large n.
-3. **SIMD / auto-vectorisation**: expose the inner loop to `-O3 -march=native` loop
+4. **SIMD / auto-vectorisation**: expose the inner loop to `-O3 -march=native` loop
    vectorisation by reformulating the carry-chain accumulator in scalar int64 + explicit
    overflow flag (avoids the `__int128` barrier to auto-vec).
-4. **Schoolbook → Karatsuba cutover** at n ≥ 32 words for O(n^1.585) complexity.
-5. **Oscillator fast-path**: batch the 8D Kuramoto RK4 into SIMD doubles (AVX2:
+5. **Schoolbook → Karatsuba cutover** at n ≥ 32 words for O(n^1.585) complexity.
+6. **Oscillator fast-path**: batch the 8D Kuramoto RK4 into SIMD doubles (AVX2:
    256-bit lanes give 4 doubles/op; 8 oscillators = 2 AVX registers); the 256 `sin()`
    calls per iteration then become the dominant cost and could be replaced with
    minimax polynomial approximation (~4× faster than `libm sin`).
-6. **Hybrid mode**: use `ll_gpu_gpucarry` for squaring but drive KV4 oscillator on CPU
+7. **Hybrid mode**: use `ll_gpu_gpucarry` for squaring but drive KV4 oscillator on CPU
    as a sidecar — getting the exact-GPU-speed answer plus the Kuramoto schedule readout.
 
 **Build:** `build_ll.bat`  (requires clang + CUDA 13.2)
@@ -380,7 +389,7 @@ ll_mpi.exe --gpu-info                   # list CUDA devices
 | `phase=Sustain` | Absorbing structure; K/γ=375:1 |
 | `phase=FineTune` | Refinement; K/γ=200:1 |
 | `phase=Lock` | Settled consensus; K/γ=150:1 |
-| `cv=0.0019` | Phase coefficient of variation (std/mean over 8 oscillators) |
+| `cv=0.0019` | Kuramoto order parameter 1−R ∈ [0,1]; R=|mean(e^{iθ})|; 0=locked, 1=spread |
 | `locked=yes` | All 50 recent CV samples below 0.05 threshold |
 | `** osc LOCKED + residue=0 **` | Double confirmation: Mersenne prime |
 | `locked=no` + `residue=non-zero` | Composite — oscillator did not synchronise |
